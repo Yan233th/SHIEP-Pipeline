@@ -1,7 +1,7 @@
 use crate::error::{EcError, EcResult};
 use crate::route_table::{PortRange, RouteRule, RouteTable};
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -110,12 +110,15 @@ pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
 fn plan_from_mode(mode: &RouteMode, host: &str, port: u16) -> EcResult<RoutePlan> {
     match mode {
         RouteMode::Matcher(matcher) => Ok(matcher.plan(host, port)),
-        RouteMode::TunnelFallback => Ok(RoutePlan::Remote {
-            dial: format!("{host}:{port}"),
-            rc_id: 0,
-            rc_name: "route-table-unavailable".to_string(),
-            source: RouteSource::RouteTableUnavailable,
-        }),
+        RouteMode::TunnelFallback => match parse_target(host) {
+            TargetKind::Ipv6(ip) => Ok(plan_ipv6_fallback(ip, port)),
+            _ => Ok(RoutePlan::Remote {
+                dial: format!("{host}:{port}"),
+                rc_id: 0,
+                rc_name: "route-table-unavailable".to_string(),
+                source: RouteSource::RouteTableUnavailable,
+            }),
+        },
         RouteMode::Unavailable => Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string())),
     }
 }
@@ -164,6 +167,7 @@ enum HostMatcher {
 enum TargetKind {
     Domain(String),
     Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
 }
 
 impl RouteMatcher {
@@ -192,6 +196,9 @@ impl RouteMatcher {
 
     fn plan(&self, host: &str, port: u16) -> RoutePlan {
         let target = parse_target(host);
+        if let TargetKind::Ipv6(ip) = target {
+            return plan_ipv6_fallback(ip, port);
+        }
         if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
             return self.plan_remote_with_rule(rule, host, port, &target);
         }
@@ -228,6 +235,7 @@ impl RouteMatcher {
                 rc_name: rule.rc_name.clone(),
                 source: RouteSource::RuleIp,
             },
+            TargetKind::Ipv6(ip) => plan_ipv6_fallback(*ip, port),
             TargetKind::Domain(domain) => {
                 if let Some(ipv4s) = self
                     .dns_map
@@ -451,6 +459,7 @@ impl RuleIndex {
                 }
                 best_idx.map(|idx| &rules[idx])
             }
+            TargetKind::Ipv6(_) => None,
         }
     }
 }
@@ -608,10 +617,20 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
 }
 
 fn parse_target(host: &str) -> TargetKind {
-    if let Ok(ip) = Ipv4Addr::from_str(host.trim()) {
+    let host = host.trim();
+    if let Ok(ip) = Ipv4Addr::from_str(host) {
         TargetKind::Ipv4(ip)
+    } else if let Ok(ip) = Ipv6Addr::from_str(host) {
+        TargetKind::Ipv6(ip)
     } else {
         TargetKind::Domain(normalize_domain(host))
+    }
+}
+
+fn plan_ipv6_fallback(ip: Ipv6Addr, port: u16) -> RoutePlan {
+    RoutePlan::Fallback {
+        target: SocketAddr::new(IpAddr::V6(ip), port).to_string(),
+        reason: "IPv6 targets are fallback-only".to_string(),
     }
 }
 
@@ -678,7 +697,7 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_fallback_mode_routes_everything_remote() {
+    fn tunnel_fallback_mode_routes_non_ipv6_targets_remote() {
         let plan = plan_from_mode(&RouteMode::TunnelFallback, "example.invalid", 443).unwrap();
         match plan {
             RoutePlan::Remote {
@@ -693,6 +712,46 @@ mod tests {
                 assert_eq!(source, RouteSource::RouteTableUnavailable);
             }
             _ => panic!("expected remote tunnel fallback plan"),
+        }
+    }
+
+    #[test]
+    fn explicit_ipv6_falls_back_before_route_matching() {
+        let table = RouteTable {
+            rules: vec![RouteRule {
+                rc_id: 400,
+                proto: 0,
+                svc: "Other".to_string(),
+                name: "must-not-match".to_string(),
+                host: "2001:db8::1".to_string(),
+                port: PortRange {
+                    start: 1,
+                    end: 65535,
+                },
+            }],
+            dns_servers: vec!["127.0.0.1:1".to_string()],
+            dns_records: vec![],
+        };
+        let matcher = RouteMatcher::from_table(table).unwrap();
+        let plan = matcher.plan("2001:db8::1", 443);
+        match plan {
+            RoutePlan::Fallback { target, reason } => {
+                assert_eq!(target, "[2001:db8::1]:443");
+                assert_eq!(reason, "IPv6 targets are fallback-only");
+            }
+            _ => panic!("expected IPv6 fallback plan"),
+        }
+    }
+
+    #[test]
+    fn tunnel_fallback_mode_keeps_ipv6_out_of_tunnel() {
+        let plan = plan_from_mode(&RouteMode::TunnelFallback, "2001:db8::1", 443).unwrap();
+        match plan {
+            RoutePlan::Fallback { target, reason } => {
+                assert_eq!(target, "[2001:db8::1]:443");
+                assert_eq!(reason, "IPv6 targets are fallback-only");
+            }
+            _ => panic!("expected IPv6 fallback plan"),
         }
     }
 
