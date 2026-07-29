@@ -30,24 +30,6 @@ pub enum RoutePlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum FlowProto {
-    Tcp,
-    Udp,
-    Icmp,
-}
-
-impl FlowProto {
-    fn code(self) -> i32 {
-        match self {
-            FlowProto::Tcp => 0,
-            FlowProto::Udp => 1,
-            FlowProto::Icmp => 2,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteSource {
     RouteTableUnavailable,
     RuleIp,
@@ -115,29 +97,19 @@ pub fn install_tunnel_fallback() -> EcResult<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
-    plan_target_with_proto(host, port, FlowProto::Tcp)
-}
-
-pub fn plan_target_with_proto(host: &str, port: u16, flow_proto: FlowProto) -> EcResult<RoutePlan> {
     let holder = ROUTER
         .get()
         .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
     let mode = holder
         .lock()
         .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
-    plan_from_mode(&mode, host, port, flow_proto)
+    plan_from_mode(&mode, host, port)
 }
 
-fn plan_from_mode(
-    mode: &RouteMode,
-    host: &str,
-    port: u16,
-    flow_proto: FlowProto,
-) -> EcResult<RoutePlan> {
+fn plan_from_mode(mode: &RouteMode, host: &str, port: u16) -> EcResult<RoutePlan> {
     match mode {
-        RouteMode::Matcher(matcher) => Ok(matcher.plan(host, port, flow_proto)),
+        RouteMode::Matcher(matcher) => Ok(matcher.plan(host, port)),
         RouteMode::TunnelFallback => Ok(RoutePlan::Remote {
             dial: format!("{host}:{port}"),
             rc_id: 0,
@@ -169,7 +141,6 @@ struct RouteMatcher {
 struct CompiledRule {
     rc_id: i32,
     rc_name: String,
-    proto: i32,
     svc: String,
     matcher: HostMatcher,
     port: PortRange,
@@ -219,23 +190,20 @@ impl RouteMatcher {
         })
     }
 
-    fn plan(&self, host: &str, port: u16, flow_proto: FlowProto) -> RoutePlan {
+    fn plan(&self, host: &str, port: u16) -> RoutePlan {
         let target = parse_target(host);
-        if let Some(rule) = self
-            .rule_index
-            .find_first_match(&self.rules, &target, port, flow_proto)
-        {
+        if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
             return self.plan_remote_with_rule(rule, host, port, &target);
         }
 
         if let TargetKind::Domain(domain) = &target
-            && let Some(plan) = self.plan_dns_data_ip_rule(port, domain, flow_proto)
+            && let Some(plan) = self.plan_dns_data_ip_rule(port, domain)
         {
             return plan;
         }
 
         if let TargetKind::Domain(domain) = &target
-            && let Some(plan) = self.plan_dnsserver_derived_rules(host, port, domain, flow_proto)
+            && let Some(plan) = self.plan_dnsserver_derived_rules(host, port, domain)
         {
             return plan;
         }
@@ -315,14 +283,9 @@ impl RouteMatcher {
         }
     }
 
-    fn plan_dns_data_ip_rule(
-        &self,
-        port: u16,
-        domain: &str,
-        flow_proto: FlowProto,
-    ) -> Option<RoutePlan> {
+    fn plan_dns_data_ip_rule(&self, port: u16, domain: &str) -> Option<RoutePlan> {
         let ips = self.dns_exact.get(domain)?;
-        self.plan_from_resolved_ips(port, ips, flow_proto, RouteSource::DnsDataIpRule)
+        self.plan_from_resolved_ips(port, ips, RouteSource::DnsDataIpRule)
     }
 
     fn plan_dnsserver_derived_rules(
@@ -330,14 +293,12 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         domain: &str,
-        flow_proto: FlowProto,
     ) -> Option<RoutePlan> {
         if self.dns_servers.is_empty() {
             return None;
         }
         let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
-        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved.aliases, flow_proto)
-        {
+        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved.aliases) {
             return Some(plan);
         }
         let source = match resolved.source {
@@ -346,7 +307,7 @@ impl RouteMatcher {
                 RouteSource::DnsServerIpRuleQuery(server)
             }
         };
-        self.plan_from_resolved_ips(port, &resolved.ips, flow_proto, source)
+        self.plan_from_resolved_ips(port, &resolved.ips, source)
     }
 
     fn plan_from_cname_aliases(
@@ -354,7 +315,6 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         aliases: &[String],
-        flow_proto: FlowProto,
     ) -> Option<RoutePlan> {
         for alias in aliases {
             let alias = normalize_domain(alias);
@@ -362,10 +322,7 @@ impl RouteMatcher {
                 continue;
             }
             let target = TargetKind::Domain(alias);
-            if let Some(rule) =
-                self.rule_index
-                    .find_first_match(&self.rules, &target, port, flow_proto)
-            {
+            if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
                 return Some(self.plan_remote_with_cname_rule(rule, host, port, &target));
             }
         }
@@ -376,15 +333,11 @@ impl RouteMatcher {
         &self,
         port: u16,
         ips: &[Ipv4Addr],
-        flow_proto: FlowProto,
         source: RouteSource,
     ) -> Option<RoutePlan> {
         for ip in ips {
             let target = TargetKind::Ipv4(*ip);
-            if let Some(rule) =
-                self.rule_index
-                    .find_first_match(&self.rules, &target, port, flow_proto)
-            {
+            if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
                 return Some(RoutePlan::Remote {
                     dial: format!("{ip}:{port}"),
                     rc_id: rule.rc_id,
@@ -461,24 +414,21 @@ impl RuleIndex {
         rules: &'a [CompiledRule],
         target: &TargetKind,
         port: u16,
-        flow_proto: FlowProto,
     ) -> Option<&'a CompiledRule> {
         match target {
             TargetKind::Domain(domain) => self
                 .domain
                 .get(domain)
                 .and_then(|ids| {
-                    ids.iter().find_map(|&idx| {
-                        rule_matches_flow(&rules[idx], port, flow_proto).then_some(idx)
-                    })
+                    ids.iter()
+                        .find_map(|&idx| rule_matches(&rules[idx], port).then_some(idx))
                 })
                 .map(|idx| &rules[idx]),
             TargetKind::Ipv4(ip) => {
                 let mut best_idx: Option<usize> = None;
                 if let Some(ids) = self.ipv4.get(ip) {
                     for &idx in ids {
-                        if rule_matches_flow(&rules[idx], port, flow_proto)
-                            && best_idx.is_none_or(|best| idx < best)
+                        if rule_matches(&rules[idx], port) && best_idx.is_none_or(|best| idx < best)
                         {
                             best_idx = Some(idx);
                         }
@@ -493,7 +443,7 @@ impl RuleIndex {
                     };
                     if *start <= needle
                         && needle <= *end
-                        && rule_matches_flow(rule, port, flow_proto)
+                        && rule_matches(rule, port)
                         && best_idx.is_none_or(|best| idx < best)
                     {
                         best_idx = Some(idx);
@@ -590,7 +540,6 @@ fn build_dns_indexes(raw_dns_records: Vec<crate::route_table::DnsRecord>) -> Dns
 struct RuleDedupKey {
     rc_id: i32,
     rc_name: String,
-    proto: i32,
     svc: String,
     matcher: MatcherDedupKey,
     port_start: u16,
@@ -614,7 +563,6 @@ impl CompiledRule {
         RuleDedupKey {
             rc_id: self.rc_id,
             rc_name: self.rc_name.clone(),
-            proto: self.proto,
             svc: self.svc.clone(),
             matcher,
             port_start: self.port.start,
@@ -624,6 +572,11 @@ impl CompiledRule {
 }
 
 fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
+    let vipall = rule.svc.trim() == "vipall";
+    if !vipall && !matches!(rule.proto, -1 | 0) {
+        return None;
+    }
+
     let matcher = if rule.host.contains('~') {
         let (start, end) = rule.host.split_once('~')?;
         let a = Ipv4Addr::from_str(start.trim()).ok()?;
@@ -648,7 +601,6 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
     Some(CompiledRule {
         rc_id: rule.rc_id,
         rc_name: rule.name,
-        proto: rule.proto,
         svc: rule.svc,
         matcher,
         port: rule.port,
@@ -671,22 +623,12 @@ fn port_matches(range: PortRange, port: u16) -> bool {
     range.start <= port && port <= range.end
 }
 
-fn proto_matches(rule_proto: i32, flow_proto: FlowProto) -> bool {
-    rule_proto == -1 || rule_proto == flow_proto.code()
-}
-
 fn is_vipall(rule: &CompiledRule) -> bool {
     rule.svc.trim() == "vipall"
 }
 
-fn rule_matches_flow(rule: &CompiledRule, port: u16, flow_proto: FlowProto) -> bool {
+fn rule_matches(rule: &CompiledRule, port: u16) -> bool {
     if is_vipall(rule) {
-        return true;
-    }
-    if !proto_matches(rule.proto, flow_proto) {
-        return false;
-    }
-    if flow_proto == FlowProto::Icmp {
         return true;
     }
     port_matches(rule.port, port)
@@ -694,7 +636,7 @@ fn rule_matches_flow(rule: &CompiledRule, port: u16, flow_proto: FlowProto) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowProto, RouteMatcher, RouteMode, RoutePlan, RouteSource, plan_from_mode};
+    use super::{RouteMatcher, RouteMode, RoutePlan, RouteSource, plan_from_mode};
     use crate::route_table::{DnsRecord, PortRange, RouteRule, RouteTable};
 
     #[test]
@@ -719,7 +661,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("ids.shiep.edu.cn", 443, FlowProto::Tcp);
+        let plan = matcher.plan("ids.shiep.edu.cn", 443);
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -737,13 +679,7 @@ mod tests {
 
     #[test]
     fn tunnel_fallback_mode_routes_everything_remote() {
-        let plan = plan_from_mode(
-            &RouteMode::TunnelFallback,
-            "example.invalid",
-            443,
-            FlowProto::Tcp,
-        )
-        .unwrap();
+        let plan = plan_from_mode(&RouteMode::TunnelFallback, "example.invalid", 443).unwrap();
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -772,7 +708,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("ecard.shiep.edu.cn", 80, FlowProto::Tcp);
+        let plan = matcher.plan("ecard.shiep.edu.cn", 80);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert_eq!(reason, "no whitelist rule matched");
@@ -803,7 +739,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("pan2.shiep.edu.cn", 10002, FlowProto::Tcp);
+        let plan = matcher.plan("pan2.shiep.edu.cn", 10002);
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -838,7 +774,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("pan2.shiep.edu.cn", 80, FlowProto::Tcp);
+        let plan = matcher.plan("pan2.shiep.edu.cn", 80);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert_eq!(reason, "no whitelist rule matched");
@@ -866,7 +802,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("dns-hide.example", 53, FlowProto::Tcp);
+        let plan = matcher.plan("dns-hide.example", 53);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert_eq!(reason, "no whitelist rule matched");
@@ -902,7 +838,6 @@ mod tests {
                 "estudent.shiep.edu.cn",
                 443,
                 &["lgwf0-46.shiep.edu.cn".to_string()],
-                FlowProto::Tcp,
             )
             .unwrap();
         match plan {
@@ -942,7 +877,6 @@ mod tests {
             "estudent.shiep.edu.cn",
             443,
             &["10.166.64.6".to_string()],
-            FlowProto::Tcp,
         );
         assert!(plan.is_none());
     }
@@ -964,7 +898,7 @@ mod tests {
         let matcher = RouteMatcher::from_table(table).unwrap();
         let ips = vec!["10.50.2.206".parse().unwrap()];
         let plan = matcher
-            .plan_from_resolved_ips(80, &ips, FlowProto::Tcp, RouteSource::DnsServerIpRuleCache)
+            .plan_from_resolved_ips(80, &ips, RouteSource::DnsServerIpRuleCache)
             .unwrap();
         match plan {
             RoutePlan::Remote {
@@ -996,7 +930,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Tcp);
+        let plan = matcher.plan("10.50.2.206", 80);
         match plan {
             RoutePlan::Remote { dial, source, .. } => {
                 assert_eq!(dial, "10.50.2.206:80");
@@ -1014,7 +948,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("example.com", 443, FlowProto::Tcp);
+        let plan = matcher.plan("example.com", 443);
         match plan {
             RoutePlan::Fallback { .. } => {}
             _ => panic!("expected fallback plan"),
@@ -1168,7 +1102,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("ids.shiep.edu.cn", 443, FlowProto::Tcp);
+        let plan = matcher.plan("ids.shiep.edu.cn", 443);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert!(reason.contains("dnsserver lookup failed"));
@@ -1178,21 +1112,35 @@ mod tests {
     }
 
     #[test]
-    fn tcp_flow_skips_udp_only_rule() {
+    fn unsupported_protocol_rules_are_excluded_from_active_index() {
         let table = RouteTable {
-            rules: vec![RouteRule {
-                rc_id: -98,
-                proto: 1,
-                svc: "".to_string(),
-                name: "__DNS_HIDE_RC1".to_string(),
-                host: "210.35.88.5".to_string(),
-                port: PortRange { start: 53, end: 53 },
-            }],
+            rules: vec![
+                RouteRule {
+                    rc_id: -98,
+                    proto: 1,
+                    svc: "".to_string(),
+                    name: "udp-only".to_string(),
+                    host: "210.35.88.5".to_string(),
+                    port: PortRange { start: 53, end: 53 },
+                },
+                RouteRule {
+                    rc_id: -99,
+                    proto: 2,
+                    svc: "".to_string(),
+                    name: "icmp-only".to_string(),
+                    host: "10.50.2.206".to_string(),
+                    port: PortRange {
+                        start: 1,
+                        end: 65535,
+                    },
+                },
+            ],
             dns_servers: vec![],
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("210.35.88.5", 53, FlowProto::Tcp);
+        assert!(matcher.rules.is_empty());
+        let plan = matcher.plan("210.35.88.5", 53);
         match plan {
             RoutePlan::Fallback { reason, .. } => {
                 assert_eq!(reason, "no whitelist rule matched");
@@ -1202,66 +1150,11 @@ mod tests {
     }
 
     #[test]
-    fn udp_flow_matches_proto1_dns_rule() {
-        let table = RouteTable {
-            rules: vec![RouteRule {
-                rc_id: -98,
-                proto: 1,
-                svc: "".to_string(),
-                name: "__DNS_HIDE_RC1".to_string(),
-                host: "210.35.88.5".to_string(),
-                port: PortRange { start: 53, end: 53 },
-            }],
-            dns_servers: vec![],
-            dns_records: vec![],
-        };
-        let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("210.35.88.5", 53, FlowProto::Udp);
-        match plan {
-            RoutePlan::Remote {
-                dial,
-                rc_id,
-                source,
-                ..
-            } => {
-                assert_eq!(dial, "210.35.88.5:53");
-                assert_eq!(rc_id, -98);
-                assert_eq!(source, RouteSource::RuleIp);
-            }
-            _ => panic!("expected remote plan"),
-        }
-    }
-
-    #[test]
-    fn udp_flow_skips_tcp_only_rule() {
-        let table = RouteTable {
-            rules: vec![RouteRule {
-                rc_id: 334,
-                proto: 0,
-                svc: "Other".to_string(),
-                name: "tcp-only".to_string(),
-                host: "10.50.2.206".to_string(),
-                port: PortRange { start: 80, end: 80 },
-            }],
-            dns_servers: vec![],
-            dns_records: vec![],
-        };
-        let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Udp);
-        match plan {
-            RoutePlan::Fallback { reason, .. } => {
-                assert_eq!(reason, "no whitelist rule matched");
-            }
-            _ => panic!("expected fallback plan"),
-        }
-    }
-
-    #[test]
-    fn vipall_ip_rule_ignores_port_and_proto_after_ip_hit() {
+    fn vipall_ip_rule_ignores_port_and_protocol_after_ip_hit() {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 336,
-                proto: 0,
+                proto: 2,
                 svc: "vipall".to_string(),
                 name: "vip-all".to_string(),
                 host: "10.50.2.206".to_string(),
@@ -1271,7 +1164,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 443, FlowProto::Udp);
+        let plan = matcher.plan("10.50.2.206", 443);
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -1288,11 +1181,11 @@ mod tests {
     }
 
     #[test]
-    fn vipall_dns_data_ip_rule_ignores_port_and_proto_after_ip_hit() {
+    fn vipall_dns_data_ip_rule_ignores_port_and_protocol_after_ip_hit() {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 337,
-                proto: 0,
+                proto: 1,
                 svc: "vipall".to_string(),
                 name: "vip-all-range".to_string(),
                 host: "10.50.2.1~10.50.2.254".to_string(),
@@ -1306,7 +1199,7 @@ mod tests {
             }],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("vip.example", 443, FlowProto::Udp);
+        let plan = matcher.plan("vip.example", 443);
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -1323,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_proto_matches_tcp_and_udp() {
+    fn wildcard_protocol_rule_remains_available_for_tcp() {
         let table = RouteTable {
             rules: vec![RouteRule {
                 rc_id: 335,
@@ -1337,63 +1230,12 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        for flow_proto in [FlowProto::Tcp, FlowProto::Udp] {
-            let plan = matcher.plan("10.50.2.206", 80, flow_proto);
-            match plan {
-                RoutePlan::Remote { rc_id, .. } => {
-                    assert_eq!(rc_id, 335);
-                }
-                _ => panic!("expected remote plan"),
-            }
-        }
-    }
-
-    #[test]
-    fn icmp_flow_ignores_port_after_proto_and_ip_hit() {
-        let table = RouteTable {
-            rules: vec![RouteRule {
-                rc_id: 338,
-                proto: 2,
-                svc: "Other".to_string(),
-                name: "icmp-only".to_string(),
-                host: "10.50.2.206".to_string(),
-                port: PortRange { start: 80, end: 80 },
-            }],
-            dns_servers: vec![],
-            dns_records: vec![],
-        };
-        let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 443, FlowProto::Icmp);
+        let plan = matcher.plan("10.50.2.206", 80);
         match plan {
-            RoutePlan::Remote { rc_id, dial, .. } => {
-                assert_eq!(rc_id, 338);
-                assert_eq!(dial, "10.50.2.206:443");
+            RoutePlan::Remote { rc_id, .. } => {
+                assert_eq!(rc_id, 335);
             }
             _ => panic!("expected remote plan"),
-        }
-    }
-
-    #[test]
-    fn icmp_flow_still_respects_proto() {
-        let table = RouteTable {
-            rules: vec![RouteRule {
-                rc_id: 339,
-                proto: 0,
-                svc: "Other".to_string(),
-                name: "tcp-only".to_string(),
-                host: "10.50.2.206".to_string(),
-                port: PortRange { start: 80, end: 80 },
-            }],
-            dns_servers: vec![],
-            dns_records: vec![],
-        };
-        let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Icmp);
-        match plan {
-            RoutePlan::Fallback { reason, .. } => {
-                assert_eq!(reason, "no whitelist rule matched");
-            }
-            _ => panic!("expected fallback plan"),
         }
     }
 
@@ -1422,7 +1264,7 @@ mod tests {
             dns_records: vec![],
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
-        let plan = matcher.plan("10.50.2.206", 80, FlowProto::Tcp);
+        let plan = matcher.plan("10.50.2.206", 80);
         match plan {
             RoutePlan::Remote { rc_id, dial, .. } => {
                 assert_eq!(rc_id, 1);

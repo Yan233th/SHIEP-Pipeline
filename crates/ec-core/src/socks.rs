@@ -105,11 +105,7 @@ fn reject_udp_associate(client: &mut TcpStream) -> EcResult<()> {
 fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) -> RouteDecision {
     let target_display = target.to_string();
     let target_is_ip = is_ip_host(target.host());
-    match crate::routing::plan_target_with_proto(
-        target.host(),
-        target.port(),
-        crate::routing::FlowProto::Tcp,
-    ) {
+    match crate::routing::plan_target(target.host(), target.port()) {
         Ok(crate::routing::RoutePlan::Remote {
             dial,
             rc_id,
