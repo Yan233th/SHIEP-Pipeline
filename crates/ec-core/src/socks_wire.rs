@@ -1,6 +1,6 @@
 use crate::error::{EcError, EcResult};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, TcpStream};
+use std::net::{Ipv6Addr, TcpStream};
 
 const SOCKS_VERSION_5: u8 = 0x05;
 const SOCKS_METHOD_NO_AUTH: u8 = 0x00;
@@ -135,101 +135,6 @@ pub(crate) fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
         .map_err(|e| EcError::Runtime(format!("socks reply write failed: {e}")))
 }
 
-pub(crate) fn write_bound_reply(
-    client: &mut TcpStream,
-    rep: u8,
-    bound: SocketAddrV4,
-) -> EcResult<()> {
-    let mut reply = Vec::with_capacity(10);
-    reply.extend_from_slice(&[SOCKS_VERSION_5, rep, SOCKS_RSV, SOCKS_ATYP_IPV4]);
-    reply.extend_from_slice(&bound.ip().octets());
-    reply.extend_from_slice(&bound.port().to_be_bytes());
-    client
-        .write_all(&reply)
-        .map_err(|e| EcError::Runtime(format!("socks bound reply write failed: {e}")))
-}
-
-pub(crate) fn parse_socks_udp_packet(data: &[u8]) -> EcResult<SocksUdpPacket> {
-    if data.len() < 4 {
-        return Err(EcError::Runtime(
-            "udp packet header is too short".to_string(),
-        ));
-    }
-    if data[0] != 0 || data[1] != 0 {
-        return Err(EcError::Runtime(
-            "udp packet with non-zero RSV is not supported".to_string(),
-        ));
-    }
-    if data[2] != 0 {
-        return Err(EcError::Runtime(
-            "fragmented udp packet is not supported".to_string(),
-        ));
-    }
-
-    let mut offset = 4;
-    let host = match data[3] {
-        SOCKS_ATYP_IPV4 => {
-            if data.len() < offset + 4 {
-                return Err(EcError::Runtime(
-                    "udp ipv4 address is truncated".to_string(),
-                ));
-            }
-            let ip = Ipv4Addr::new(
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            );
-            offset += 4;
-            ip.to_string()
-        }
-        SOCKS_ATYP_DOMAIN => {
-            if data.len() < offset + 1 {
-                return Err(EcError::Runtime(
-                    "udp domain length is truncated".to_string(),
-                ));
-            }
-            let len = data[offset] as usize;
-            offset += 1;
-            if data.len() < offset + len {
-                return Err(EcError::Runtime("udp domain is truncated".to_string()));
-            }
-            let domain = String::from_utf8(data[offset..offset + len].to_vec())
-                .map_err(|e| EcError::Runtime(format!("invalid udp domain utf8: {e}")))?;
-            offset += len;
-            domain
-        }
-        SOCKS_ATYP_IPV6 => {
-            return Err(EcError::Runtime(
-                "udp ipv6 targets are not supported yet".to_string(),
-            ));
-        }
-        atyp => {
-            return Err(EcError::Runtime(format!(
-                "unsupported udp atyp: 0x{atyp:02x}"
-            )));
-        }
-    };
-    if data.len() < offset + 2 {
-        return Err(EcError::Runtime("udp port is truncated".to_string()));
-    }
-    let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-    offset += 2;
-    Ok(SocksUdpPacket {
-        target: ConnectTarget { host, port },
-        payload: data[offset..].to_vec(),
-    })
-}
-
-pub(crate) fn encode_socks_udp_packet(source: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + payload.len());
-    out.extend_from_slice(&[0, 0, 0, SOCKS_ATYP_IPV4]);
-    out.extend_from_slice(&source.ip().octets());
-    out.extend_from_slice(&source.port().to_be_bytes());
-    out.extend_from_slice(payload);
-    out
-}
-
 pub(crate) fn format_socket_target(host: &str, port: impl std::fmt::Display) -> String {
     let h = host.trim();
     if h.parse::<Ipv6Addr>().is_ok() {
@@ -271,11 +176,6 @@ pub(crate) struct SocksRequest {
     pub(crate) target: ConnectTarget,
 }
 
-pub(crate) struct SocksUdpPacket {
-    pub(crate) target: ConnectTarget,
-    pub(crate) payload: Vec<u8>,
-}
-
 #[derive(Clone)]
 pub(crate) struct ConnectTarget {
     host: String,
@@ -300,49 +200,12 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{SocksCommand, encode_socks_udp_packet, parse_socks_udp_packet};
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use super::SocksCommand;
 
     #[test]
     fn socks_command_maps_known_values() {
         assert_eq!(SocksCommand::from_byte(0x01), SocksCommand::Connect);
         assert_eq!(SocksCommand::from_byte(0x03), SocksCommand::UdpAssociate);
         assert_eq!(SocksCommand::from_byte(0x02), SocksCommand::Other(0x02));
-    }
-
-    #[test]
-    fn parse_socks_udp_packet_reads_ipv4_target() {
-        let raw = [0, 0, 0, 1, 10, 50, 2, 206, 0, 53, b'q', b'1'];
-        let packet = parse_socks_udp_packet(&raw).unwrap();
-        assert_eq!(packet.target.host(), "10.50.2.206");
-        assert_eq!(packet.target.port(), 53);
-        assert_eq!(packet.payload, b"q1");
-    }
-
-    #[test]
-    fn parse_socks_udp_packet_reads_domain_target() {
-        let raw = [
-            0, 0, 0, 3, 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0, 53, b'q',
-        ];
-        let packet = parse_socks_udp_packet(&raw).unwrap();
-        assert_eq!(packet.target.host(), "example");
-        assert_eq!(packet.target.port(), 53);
-        assert_eq!(packet.payload, b"q");
-    }
-
-    #[test]
-    fn parse_socks_udp_packet_rejects_fragments() {
-        let raw = [0, 0, 1, 1, 10, 50, 2, 206, 0, 53];
-        assert!(parse_socks_udp_packet(&raw).is_err());
-    }
-
-    #[test]
-    fn encode_socks_udp_packet_writes_ipv4_source() {
-        let source = SocketAddrV4::new(Ipv4Addr::new(10, 50, 2, 206), 53);
-        let packet = encode_socks_udp_packet(source, b"ans");
-        assert_eq!(
-            packet,
-            vec![0, 0, 0, 1, 10, 50, 2, 206, 0, 53, b'a', b'n', b's']
-        );
     }
 }

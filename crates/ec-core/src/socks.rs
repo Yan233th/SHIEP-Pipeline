@@ -2,21 +2,14 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, RouteKind, Scope};
 use crate::socks_proxy::{FallbackProxy, connect_via_proxy, parse_fallback_proxy};
 use crate::socks_wire::{
-    ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_GENERAL_FAILURE, SOCKS_REP_SUCCEEDED,
-    SocksCommand, encode_socks_udp_packet, format_socket_target, negotiate_method,
-    parse_socks_udp_packet, read_socks_request, write_bound_reply, write_reply,
+    ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_SUCCEEDED, SocksCommand,
+    format_socket_target, negotiate_method, read_socks_request, write_reply,
 };
-use std::io::ErrorKind;
 use std::io::{Read, Write};
-use std::net::{
-    Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs,
-    UdpSocket,
-};
-use std::sync::{Arc, Mutex, mpsc};
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
-const UDP_RELAY_BUFFER_SIZE: usize = 64 * 1024;
 
 pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
@@ -78,7 +71,7 @@ fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) 
     let request = read_socks_request(&mut client)?;
     match request.command {
         SocksCommand::Connect => handle_connect(client, request.target, fallback_proxy),
-        SocksCommand::UdpAssociate => handle_udp_associate(client, fallback_proxy),
+        SocksCommand::UdpAssociate => reject_udp_associate(&mut client),
         SocksCommand::Other(_) => {
             let _ = write_reply(&mut client, SOCKS_REP_CMD_NOT_SUPPORTED);
             Err(EcError::Runtime(format!(
@@ -100,80 +93,13 @@ fn handle_connect(
     execute_route(client, target_display.as_str(), route)
 }
 
-fn handle_udp_associate(
-    mut client: TcpStream,
-    fallback_proxy: Option<&FallbackProxy>,
-) -> EcResult<()> {
-    let relay_bind = udp_relay_bind_addr(&client)?;
-    let udp_socket = Arc::new(
-        UdpSocket::bind(relay_bind)
-            .map_err(|e| EcError::Runtime(format!("udp relay bind failed: {e}")))?,
-    );
-    let relay_addr = match udp_socket
-        .local_addr()
-        .map_err(|e| EcError::Runtime(format!("udp relay local addr failed: {e}")))?
-    {
-        SocketAddr::V4(addr) => addr,
-        SocketAddr::V6(_) => {
-            let _ = write_reply(&mut client, SOCKS_REP_GENERAL_FAILURE);
-            return Err(EcError::Runtime(
-                "udp relay only supports ipv4 bind address".to_string(),
-            ));
-        }
-    };
-
-    let mut control = client
-        .try_clone()
-        .map_err(|e| EcError::Runtime(format!("clone socks control stream failed: {e}")))?;
-    let udp_assoc = crate::netstack::open_udp_association()?;
-    let tunnel_sender = udp_assoc.sender();
-    let tunnel_rx = udp_assoc.into_receiver();
-    if let Err(err) = write_bound_reply(&mut client, SOCKS_REP_SUCCEEDED, relay_addr) {
-        let _ = tunnel_sender.close();
-        return Err(err);
-    }
-    output::info(
+fn reject_udp_associate(client: &mut TcpStream) -> EcResult<()> {
+    write_reply(client, SOCKS_REP_CMD_NOT_SUPPORTED)?;
+    output::warn(
         Scope::Req,
-        format_args!("UDP ASSOCIATE -> {}", output::value(relay_addr)),
+        "UDP ASSOCIATE rejected: UDP tunnel transport is not supported",
     );
-
-    let client_peer = Arc::new(Mutex::new(None::<SocketAddr>));
-    let tunnel_socket = Arc::clone(&udp_socket);
-    let tunnel_peer = Arc::clone(&client_peer);
-    let tunnel_to_client = thread::spawn(move || {
-        forward_udp_from_tunnel(tunnel_rx, tunnel_socket, tunnel_peer);
-    });
-
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let control_addr = relay_addr;
-    let control_watcher = thread::spawn(move || {
-        let mut buf = [0u8; 1];
-        loop {
-            match control.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    continue;
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = stop_tx.send(());
-        wake_udp_relay(control_addr);
-    });
-
-    let relay_result = run_udp_relay(
-        udp_socket,
-        &tunnel_sender,
-        fallback_proxy,
-        client_peer,
-        stop_rx,
-    );
-    let _ = tunnel_sender.close();
-    let _ = client.shutdown(Shutdown::Both);
-    let _ = tunnel_to_client.join();
-    let _ = control_watcher.join();
-    relay_result
+    Ok(())
 }
 
 fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) -> RouteDecision {
@@ -208,74 +134,6 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             fallback_proxy,
         ),
         Err(err) => route_decision_planner_error(target_display.as_str(), err),
-    }
-}
-
-fn decide_udp_route(
-    target: &ConnectTarget,
-    fallback_proxy: Option<&FallbackProxy>,
-) -> UdpRouteDecision {
-    let target_display = target.to_string();
-    let target_is_ip = is_ip_host(target.host());
-    match crate::routing::plan_target_with_proto(
-        target.host(),
-        target.port(),
-        crate::routing::FlowProto::Udp,
-    ) {
-        Ok(crate::routing::RoutePlan::Remote {
-            dial,
-            rc_id,
-            rc_name,
-            source,
-        }) => {
-            let resolved_ip = dial
-                .rsplit_once(':')
-                .map(|(ip, _)| ip)
-                .unwrap_or(dial.as_str());
-            log_resolved_route_source(target.host(), resolved_ip, rc_id, source);
-            let decision =
-                route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source);
-            let transport =
-                match decision_tunnel_target(&decision).and_then(resolve_dial_v4_from_str) {
-                    Ok(target) => UdpRouteTransport::Tunnel(target),
-                    Err(err) => UdpRouteTransport::Unsupported(format!(
-                        "udp remote target is not ipv4: {}",
-                        crate::error::concise_error(err)
-                    )),
-                };
-            UdpRouteDecision {
-                line: decision.line,
-                path: decision.path,
-                transport,
-            }
-        }
-        Ok(crate::routing::RoutePlan::Fallback {
-            target: planned_target,
-            reason,
-        }) => {
-            let decision = route_decision_fallback(
-                target.clone(),
-                target_display.as_str(),
-                target_addr(&planned_target),
-                reason,
-                fallback_proxy,
-            );
-            UdpRouteDecision {
-                line: decision.line,
-                path: decision.path,
-                transport: UdpRouteTransport::Unsupported(
-                    "udp fallback transport is not supported yet".to_string(),
-                ),
-            }
-        }
-        Err(err) => {
-            let decision = route_decision_planner_error(target_display.as_str(), err);
-            UdpRouteDecision {
-                line: decision.line,
-                path: decision.path,
-                transport: UdpRouteTransport::Unsupported("route planner unavailable".to_string()),
-            }
-        }
     }
 }
 
@@ -329,132 +187,6 @@ fn log_resolved_route_source(
             );
         }
         _ => {}
-    }
-}
-
-fn decision_tunnel_target(decision: &RouteDecision) -> EcResult<&str> {
-    match &decision.transport {
-        RouteTransport::Tunnel(dial) => Ok(dial),
-        _ => Err(EcError::Runtime(
-            "route decision is not a tunnel transport".to_string(),
-        )),
-    }
-}
-
-fn udp_relay_bind_addr(client: &TcpStream) -> EcResult<SocketAddrV4> {
-    match client
-        .local_addr()
-        .map_err(|e| EcError::Runtime(format!("socks control local addr failed: {e}")))?
-    {
-        SocketAddr::V4(addr) => Ok(SocketAddrV4::new(*addr.ip(), 0)),
-        SocketAddr::V6(_) => Err(EcError::Runtime(
-            "udp associate over ipv6 control connection is not supported".to_string(),
-        )),
-    }
-}
-
-fn run_udp_relay(
-    socket: Arc<UdpSocket>,
-    tunnel_sender: &crate::netstack::TunnelUdpSender,
-    fallback_proxy: Option<&FallbackProxy>,
-    client_peer: Arc<Mutex<Option<SocketAddr>>>,
-    stop_rx: mpsc::Receiver<()>,
-) -> EcResult<()> {
-    let mut buf = vec![0u8; UDP_RELAY_BUFFER_SIZE];
-    loop {
-        let (n, peer) = socket
-            .recv_from(&mut buf)
-            .map_err(|e| EcError::Runtime(format!("udp relay recv failed: {e}")))?;
-        if stop_rx.try_recv().is_ok() {
-            break;
-        }
-        if n == 0 {
-            continue;
-        }
-        if !remember_udp_client(&client_peer, peer) {
-            output::warn(
-                Scope::Req,
-                format_args!(
-                    "drop udp packet from unexpected peer {}",
-                    output::value(peer)
-                ),
-            );
-            continue;
-        }
-
-        let packet = match parse_socks_udp_packet(&buf[..n]) {
-            Ok(packet) => packet,
-            Err(err) => {
-                output::warn(
-                    Scope::Req,
-                    format_args!(
-                        "drop invalid udp packet: {}",
-                        crate::error::concise_error(err)
-                    ),
-                );
-                continue;
-            }
-        };
-        let route = decide_udp_route(&packet.target, fallback_proxy);
-        output::info(Scope::Req, &route.line);
-        match route.transport {
-            UdpRouteTransport::Tunnel(target) => {
-                if let Err(err) = tunnel_sender.send(target, packet.payload) {
-                    output::error(
-                        Scope::Upstream,
-                        format_args!(
-                            "{}; error: {}",
-                            route.path,
-                            crate::error::concise_error(err)
-                        ),
-                    );
-                }
-            }
-            UdpRouteTransport::Unsupported(reason) => {
-                output::error(
-                    Scope::Upstream,
-                    format_args!("{}; error: {reason}", route.path),
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn forward_udp_from_tunnel(
-    tunnel_rx: mpsc::Receiver<crate::netstack::UdpDatagram>,
-    socket: Arc<UdpSocket>,
-    client_peer: Arc<Mutex<Option<SocketAddr>>>,
-) {
-    while let Ok(datagram) = tunnel_rx.recv() {
-        let Some(peer) = current_udp_client(&client_peer) else {
-            continue;
-        };
-        let packet = encode_socks_udp_packet(datagram.source, &datagram.data);
-        let _ = socket.send_to(&packet, peer);
-    }
-}
-
-fn remember_udp_client(client_peer: &Mutex<Option<SocketAddr>>, peer: SocketAddr) -> bool {
-    let Ok(mut guard) = client_peer.lock() else {
-        return false;
-    };
-    match *guard {
-        Some(existing) => existing == peer,
-        None => {
-            *guard = Some(peer);
-            true
-        }
-    }
-}
-
-fn current_udp_client(client_peer: &Mutex<Option<SocketAddr>>) -> Option<SocketAddr> {
-    client_peer.lock().ok().and_then(|guard| *guard)
-}
-
-fn wake_udp_relay(relay_addr: SocketAddrV4) {
-    if let Ok(waker) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)) {
-        let _ = waker.send_to(&[], relay_addr);
     }
 }
 
@@ -678,20 +410,6 @@ fn pump_stream(mut src: TcpStream, mut dst: TcpStream) {
     let _ = dst.shutdown(Shutdown::Write);
 }
 
-fn resolve_dial_v4_from_str(target: &str) -> EcResult<SocketAddrV4> {
-    let mut addrs = target
-        .to_socket_addrs()
-        .map_err(|e| EcError::Runtime(format!("resolve udp target failed: {target}: {e}")))?;
-    addrs
-        .find_map(|addr| match addr {
-            SocketAddr::V4(v4) => Some(v4),
-            SocketAddr::V6(_) => None,
-        })
-        .ok_or_else(|| {
-            EcError::Runtime(format!("no ipv4 address resolved for udp target {target}"))
-        })
-}
-
 enum RouteTransport {
     Tunnel(String),
     Direct(String),
@@ -703,17 +421,6 @@ struct RouteDecision {
     line: String,
     path: String,
     transport: RouteTransport,
-}
-
-enum UdpRouteTransport {
-    Tunnel(SocketAddrV4),
-    Unsupported(String),
-}
-
-struct UdpRouteDecision {
-    line: String,
-    path: String,
-    transport: UdpRouteTransport,
 }
 
 fn target_addr(target: &str) -> String {
@@ -729,7 +436,10 @@ fn is_ip_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_bind_addr;
+    use super::{handle_client, normalize_bind_addr};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     #[test]
     fn normalize_bind_addr_expands_port_only() {
@@ -739,5 +449,29 @@ mod tests {
     #[test]
     fn normalize_bind_addr_keeps_explicit_host() {
         assert_eq!(normalize_bind_addr("127.0.0.1:1080"), "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn udp_associate_is_rejected_at_the_socks_boundary() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_client(stream, None)
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut method_reply = [0u8; 2];
+        client.read_exact(&mut method_reply).unwrap();
+        assert_eq!(method_reply, [0x05, 0x00]);
+
+        client
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        let mut command_reply = [0u8; 10];
+        client.read_exact(&mut command_reply).unwrap();
+        assert_eq!(command_reply[1], 0x07);
+        assert!(server.join().unwrap().is_ok());
     }
 }

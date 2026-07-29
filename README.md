@@ -15,7 +15,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - Username/password login (RSA-encrypted password flow)
 - Session and agent token acquisition
 - VPN tunnel setup with RX/TX runtime
-- Local SOCKS5 listener (CONNECT and UDP ASSOCIATE for remote routes, no auth)
+- Local SOCKS5 listener (CONNECT only, no auth)
 - Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
 - Route table based target decisions using whitelist rules, DNS records, DNS server lookup, CNAMEs, and IP-range matches
 - Configurable TCP fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
@@ -86,7 +86,7 @@ SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
 - With `--fallback`, TCP traffic goes through the upstream proxy.
 - Without `--fallback`, TCP traffic goes direct.
 - If the route table cannot be fetched, routing degrades to tunnel mode and requests are marked as `route-table-unavailable`.
-- UDP ASSOCIATE is supported for remote routes. UDP fallback is not supported.
+- UDP ASSOCIATE is explicitly rejected; proxied traffic is TCP-only.
 
 Supported fallback proxy input formats:
 
