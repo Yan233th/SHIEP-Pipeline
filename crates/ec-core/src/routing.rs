@@ -13,6 +13,7 @@ pub struct RouteInstallSummary {
     pub rule_count: usize,
     pub dns_server_count: usize,
     pub dns_record_count: usize,
+    pub dns_scope_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +78,7 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
         rule_count: matcher.rules.len(),
         dns_server_count: matcher.dns_servers.len(),
         dns_record_count: matcher.dns_records,
+        dns_scope_count: matcher.trusted_dns_scopes.len(),
     };
     let holder = ROUTER.get_or_init(|| Mutex::new(RouteMode::Unavailable));
     let mut guard = holder
@@ -138,6 +140,7 @@ struct RouteMatcher {
     dns_exact: HashMap<String, Vec<Ipv4Addr>>,
     dns_servers: Vec<SocketAddr>,
     dns_records: usize,
+    trusted_dns_scopes: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,13 @@ enum TargetKind {
     Ipv6(Ipv6Addr),
 }
 
+#[derive(Debug, Default)]
+struct DnsScopeTrieNode {
+    children: HashMap<String, DnsScopeTrieNode>,
+    terminal: bool,
+    synthetic: bool,
+}
+
 impl RouteMatcher {
     fn from_table(table: RouteTable) -> EcResult<Self> {
         let RouteTable {
@@ -181,6 +191,11 @@ impl RouteMatcher {
 
         let rules = compile_rules(raw_rules);
         let rule_index = RuleIndex::build(&rules);
+        let trusted_dns_scopes =
+            infer_trusted_dns_scopes(rules.iter().filter_map(|rule| match &rule.matcher {
+                HostMatcher::Domain(domain) => Some(domain.as_str()),
+                HostMatcher::Ipv4(_) | HostMatcher::Ipv4Range(_, _) => None,
+            }));
         let dns_indexes = build_dns_indexes(raw_dns_records);
         let dns_servers = normalize_dns_servers(dns_servers);
 
@@ -191,6 +206,7 @@ impl RouteMatcher {
             dns_exact: dns_indexes.exact,
             dns_servers,
             dns_records: dns_indexes.record_count,
+            trusted_dns_scopes,
         })
     }
 
@@ -379,6 +395,77 @@ impl RouteMatcher {
             other => other,
         }
     }
+}
+
+impl DnsScopeTrieNode {
+    fn insert(&mut self, domain: &str) {
+        let mut node = self;
+        for label in domain.split('.').rev() {
+            if label.is_empty() {
+                return;
+            }
+            node = node.children.entry(label.to_string()).or_default();
+        }
+        node.terminal = true;
+    }
+
+    fn collapse(&mut self, depth: usize) {
+        for child in self.children.values_mut() {
+            child.collapse(depth + 1);
+        }
+
+        if depth >= 2
+            && self
+                .children
+                .values()
+                .filter(|child| child.is_leaf())
+                .count()
+                >= 2
+        {
+            self.children.clear();
+            self.synthetic = true;
+        }
+    }
+
+    fn collect_synthetic_leaves<'a>(
+        &'a self,
+        reversed_labels: &mut Vec<&'a str>,
+        scopes: &mut HashSet<String>,
+    ) {
+        if self.synthetic && self.children.is_empty() {
+            scopes.insert(
+                reversed_labels
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("."),
+            );
+            return;
+        }
+
+        for (label, child) in &self.children {
+            reversed_labels.push(label);
+            child.collect_synthetic_leaves(reversed_labels, scopes);
+            reversed_labels.pop();
+        }
+    }
+
+    fn is_leaf(&self) -> bool {
+        self.children.is_empty() && (self.terminal || self.synthetic)
+    }
+}
+
+fn infer_trusted_dns_scopes<'a>(domains: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
+    let mut root = DnsScopeTrieNode::default();
+    for domain in domains {
+        root.insert(domain);
+    }
+    root.collapse(0);
+
+    let mut scopes = HashSet::new();
+    root.collect_synthetic_leaves(&mut Vec::new(), &mut scopes);
+    scopes
 }
 
 fn cname_route_source(source: RouteSource) -> RouteSource {
@@ -655,7 +742,9 @@ fn rule_matches(rule: &CompiledRule, port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouteMatcher, RouteMode, RoutePlan, RouteSource, plan_from_mode};
+    use super::{
+        RouteMatcher, RouteMode, RoutePlan, RouteSource, infer_trusted_dns_scopes, plan_from_mode,
+    };
     use crate::route_table::{DnsRecord, PortRange, RouteRule, RouteTable};
 
     #[test]
@@ -694,6 +783,46 @@ mod tests {
             }
             _ => panic!("expected remote plan"),
         }
+    }
+
+    #[test]
+    fn dns_scope_trie_merges_sibling_domain_leaves() {
+        let scopes =
+            infer_trusted_dns_scopes(["pan.shiep.edu.cn", "ids.shiep.edu.cn", "pan.shiep.edu.cn"]);
+
+        assert_eq!(scopes, ["shiep.edu.cn".to_string()].into());
+    }
+
+    #[test]
+    fn dns_scope_trie_does_not_count_terminal_internal_nodes_as_leaves() {
+        let scopes = infer_trusted_dns_scopes(["shiep.edu.cn", "ids.shiep.edu.cn"]);
+
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn dns_scope_trie_recursively_merges_but_stops_before_one_label() {
+        let scopes = infer_trusted_dns_scopes([
+            "pan.shiep.edu.cn",
+            "ids.shiep.edu.cn",
+            "portal.other.edu.cn",
+            "mail.other.edu.cn",
+            "foo.com",
+            "bar.com",
+        ]);
+
+        assert_eq!(scopes, ["edu.cn".to_string()].into());
+    }
+
+    #[test]
+    fn dns_scope_trie_collapses_entire_mixed_subtree() {
+        let scopes = infer_trusted_dns_scopes([
+            "pan.shiep.edu.cn",
+            "ids.shiep.edu.cn",
+            "deep.branch.shiep.edu.cn",
+        ]);
+
+        assert_eq!(scopes, ["shiep.edu.cn".to_string()].into());
     }
 
     #[test]
