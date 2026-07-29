@@ -16,6 +16,6 @@ quick-xml = "0.39.2"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"] }
 rsa = "0.9.10"
 socket2 = { version = "0.6.2", features = ["all"] }
-smoltcp = { version = "0.12.0", default-features = false, features = ["std", "proto-ipv4", "socket", "socket-tcp", "socket-udp", "medium-ip", "alloc"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "proto-ipv4", "socket", "socket-tcp", "medium-ip", "alloc"] }
 thiserror = "2.0.18"
 urlencoding = "2.1.3"
