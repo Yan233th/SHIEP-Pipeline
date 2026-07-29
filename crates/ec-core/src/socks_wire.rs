@@ -194,18 +194,29 @@ impl ConnectTarget {
 
 impl std::fmt::Display for ConnectTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        f.write_str(&format_socket_target(&self.host, self.port))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::SocksCommand;
+    use super::{ConnectTarget, SocksCommand, format_socket_target};
 
     #[test]
     fn socks_command_maps_known_values() {
         assert_eq!(SocksCommand::from_byte(0x01), SocksCommand::Connect);
         assert_eq!(SocksCommand::from_byte(0x03), SocksCommand::UdpAssociate);
         assert_eq!(SocksCommand::from_byte(0x02), SocksCommand::Other(0x02));
+    }
+
+    #[test]
+    fn ipv6_targets_use_bracketed_socket_format() {
+        let target = ConnectTarget {
+            host: "2001:db8::1".to_string(),
+            port: 443,
+        };
+
+        assert_eq!(target.to_string(), "[2001:db8::1]:443");
+        assert_eq!(format_socket_target("example.com", 443), "example.com:443");
     }
 }

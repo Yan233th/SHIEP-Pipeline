@@ -1,5 +1,6 @@
 use crate::error::{EcError, EcResult};
 use crate::output;
+use crate::socks_wire::format_socket_target;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
 
@@ -99,16 +100,20 @@ fn connect_via_socks5_proxy(proxy_addr: &str, host: &str, port: u16) -> EcResult
 
 fn connect_via_http_connect_proxy(proxy_addr: &str, host: &str, port: u16) -> EcResult<TcpStream> {
     let mut stream = connect_tcp_stream(proxy_addr, "fallback http proxy")?;
-    let authority = format_socket_target(host, port);
-    let request = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
-    );
+    let request = build_http_connect_request(host, port);
     stream
         .write_all(request.as_bytes())
         .map_err(|e| EcError::Runtime(format!("http proxy connect request write failed: {e}")))?;
     let reply_head = read_http_proxy_head(&mut stream)?;
     ensure_http_connect_success(reply_head.as_str())?;
     Ok(stream)
+}
+
+fn build_http_connect_request(host: &str, port: u16) -> String {
+    let authority = format_socket_target(host, port);
+    format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
+    )
 }
 
 fn connect_tcp_stream(addr: &str, label: &str) -> EcResult<TcpStream> {
@@ -292,18 +297,13 @@ fn consume_socks5_addr_and_port(stream: &mut TcpStream, atyp: u8) -> EcResult<()
     Ok(())
 }
 
-fn format_socket_target(host: &str, port: u16) -> String {
-    let h = host.trim();
-    if h.parse::<Ipv6Addr>().is_ok() {
-        format!("[{h}]:{port}")
-    } else {
-        format!("{h}:{port}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ensure_http_connect_success, parse_fallback_proxy};
+    use super::{
+        SOCKS_ATYP_IPV6, append_socks5_addr, build_http_connect_request,
+        ensure_http_connect_success, parse_fallback_proxy,
+    };
+    use std::net::Ipv6Addr;
 
     #[test]
     fn parse_fallback_proxy_accepts_socks5_scheme() {
@@ -355,5 +355,24 @@ mod tests {
     fn http_connect_success_rejects_non_http_response() {
         let err = ensure_http_connect_success("HELLO\r\n\r\n").unwrap_err();
         assert!(err.to_string().contains("invalid http proxy connect reply"));
+    }
+
+    #[test]
+    fn socks5_ipv6_target_uses_ipv6_atyp_and_full_address() {
+        let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let mut encoded = Vec::new();
+
+        append_socks5_addr(&mut encoded, &ip.to_string()).unwrap();
+
+        assert_eq!(encoded[0], SOCKS_ATYP_IPV6);
+        assert_eq!(&encoded[1..], &ip.octets());
+    }
+
+    #[test]
+    fn http_connect_ipv6_target_uses_bracketed_authority() {
+        let request = build_http_connect_request("2001:db8::1", 443);
+
+        assert!(request.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"));
+        assert!(request.contains("Host: [2001:db8::1]:443\r\n"));
     }
 }

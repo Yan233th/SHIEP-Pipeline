@@ -432,7 +432,7 @@ fn is_ip_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_client, normalize_bind_addr};
+    use super::{handle_client, normalize_bind_addr, target_addr};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -445,6 +445,11 @@ mod tests {
     #[test]
     fn normalize_bind_addr_keeps_explicit_host() {
         assert_eq!(normalize_bind_addr("127.0.0.1:1080"), "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn direct_fallback_keeps_ipv6_target_bracketed() {
+        assert_eq!(target_addr("[2001:db8::1]:443"), "[2001:db8::1]:443");
     }
 
     #[test]

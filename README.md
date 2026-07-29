@@ -19,6 +19,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
 - Route table based target decisions using whitelist rules, DNS records, DNS server lookup, CNAMEs, and IP-range matches
 - Configurable TCP fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
+- IPv6 TCP targets via fallback only; IPv6 traffic never enters the VPN tunnel
 - Explicit tunnel degradation when the route table is unavailable
 - Structured, colorized logging that balances operational detail and visual clarity
 
@@ -86,6 +87,7 @@ SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
 - With `--fallback`, TCP traffic goes through the upstream proxy.
 - Without `--fallback`, TCP traffic goes direct.
 - If the route table cannot be fetched, routing degrades to tunnel mode and requests are marked as `route-table-unavailable`.
+- Explicit IPv6 TCP targets always use fallback, even when route-table loading fails; IPv6 tunnel routing is not supported.
 - UDP ASSOCIATE is explicitly rejected; proxied traffic is TCP-only.
 
 Supported fallback proxy input formats:
