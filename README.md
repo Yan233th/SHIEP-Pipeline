@@ -17,7 +17,7 @@ The project focuses on minimal scope, clear structure, and maintainability, with
 - VPN tunnel setup with RX/TX runtime
 - Local SOCKS5 listener (CONNECT only, no auth)
 - Automatic route-table fetch and parse (`/por/rclist.csp`) for split-routing decisions
-- Route table based target decisions using whitelist rules, DNS records, DNS server lookup, CNAMEs, and IP-range matches
+- Route table based target decisions using whitelist rules, DNS records, scoped DNS server lookup, CNAMEs, and IP-range matches
 - Configurable TCP fallback routing (non-whitelist -> direct or upstream proxy via `--fallback`)
 - IPv6 TCP targets via fallback only; IPv6 traffic never enters the VPN tunnel
 - Explicit tunnel degradation when the route table is unavailable
@@ -83,6 +83,8 @@ SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
 
 - The app fetches and parses route rules from `/por/rclist.csp`.
 - If a route-table rule or trusted route-table DNS resolution chain matches, traffic goes remote.
+- DNS Server lookup for otherwise unknown domains is limited to scopes inferred from active route-table domain rules, preventing unrelated domains from being disclosed to VPN-provided DNS servers.
+- Route-table `dns.data` records remain local resolution data and do not authorize DNS query scopes.
 - If no whitelist rule matches, TCP traffic goes fallback.
 - With `--fallback`, TCP traffic goes through the upstream proxy.
 - Without `--fallback`, TCP traffic goes direct.

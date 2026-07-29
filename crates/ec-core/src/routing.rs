@@ -318,7 +318,7 @@ impl RouteMatcher {
         port: u16,
         domain: &str,
     ) -> Option<RoutePlan> {
-        if self.dns_servers.is_empty() {
+        if self.dns_servers.is_empty() || !self.is_trusted_dns_domain(domain) {
             return None;
         }
         let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
@@ -351,6 +351,19 @@ impl RouteMatcher {
             }
         }
         None
+    }
+
+    fn is_trusted_dns_domain(&self, domain: &str) -> bool {
+        let mut candidate = domain;
+        loop {
+            if self.trusted_dns_scopes.contains(candidate) {
+                return true;
+            }
+            let Some((_, parent)) = candidate.split_once('.') else {
+                return false;
+            };
+            candidate = parent;
+        }
     }
 
     fn plan_from_resolved_ips(
@@ -826,6 +839,48 @@ mod tests {
     }
 
     #[test]
+    fn inferred_dns_scope_authorizes_itself_and_subdomains_only() {
+        let matcher = RouteMatcher::from_table(RouteTable {
+            rules: vec![
+                domain_rule(201, "pan.shiep.edu.cn"),
+                domain_rule(202, "ids.shiep.edu.cn"),
+            ],
+            dns_servers: vec![],
+            dns_records: vec![],
+        })
+        .unwrap();
+
+        assert!(matcher.is_trusted_dns_domain("shiep.edu.cn"));
+        assert!(matcher.is_trusted_dns_domain("pan2.shiep.edu.cn"));
+        assert!(matcher.is_trusted_dns_domain("estudent.shiep.edu.cn"));
+        assert!(!matcher.is_trusted_dns_domain("github.com"));
+        assert!(!matcher.is_trusted_dns_domain("api.github.com"));
+        assert!(!matcher.is_trusted_dns_domain("notshiep.edu.cn"));
+    }
+
+    #[test]
+    fn untrusted_domain_skips_dnsserver_derived_matching() {
+        let matcher = RouteMatcher::from_table(RouteTable {
+            rules: vec![
+                domain_rule(201, "pan.shiep.edu.cn"),
+                domain_rule(202, "ids.shiep.edu.cn"),
+            ],
+            dns_servers: vec!["127.0.0.1:1".to_string()],
+            dns_records: vec![],
+        })
+        .unwrap();
+
+        let plan = matcher.plan("github.com", 443);
+        match plan {
+            RoutePlan::Fallback { target, reason } => {
+                assert_eq!(target, "github.com:443");
+                assert_eq!(reason, "no whitelist rule matched");
+            }
+            _ => panic!("expected fallback plan"),
+        }
+    }
+
+    #[test]
     fn tunnel_fallback_mode_routes_non_ipv6_targets_remote() {
         let plan = plan_from_mode(&RouteMode::TunnelFallback, "example.invalid", 443).unwrap();
         match plan {
@@ -1255,6 +1310,20 @@ mod tests {
                 "114.114.114.114:53".parse().unwrap()
             ]
         );
+    }
+
+    fn domain_rule(rc_id: i32, host: &str) -> RouteRule {
+        RouteRule {
+            rc_id,
+            proto: 0,
+            svc: "Other".to_string(),
+            name: host.to_string(),
+            host: host.to_string(),
+            port: PortRange {
+                start: 1,
+                end: 65535,
+            },
+        }
     }
 
     #[test]
