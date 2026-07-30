@@ -83,14 +83,27 @@ SHIEP_PIPELINE_PASSWORD=<PASSWORD> ./SHIEP-Pipeline \
 
 - The app fetches and parses route rules from `/por/rclist.csp`.
 - If a route-table rule or trusted route-table DNS resolution chain matches, traffic goes remote.
-- DNS Server lookup for otherwise unknown domains is limited to scopes inferred from active route-table domain rules, preventing unrelated domains from being disclosed to VPN-provided DNS servers.
-- Route-table `dns.data` records remain local resolution data and do not authorize DNS query scopes.
 - If no whitelist rule matches, TCP traffic goes fallback.
 - With `--fallback`, TCP traffic goes through the upstream proxy.
 - Without `--fallback`, TCP traffic goes direct.
 - If the route table cannot be fetched, routing degrades to tunnel mode and requests are marked as `route-table-unavailable`.
 - Explicit IPv6 TCP targets always use fallback, even when route-table loading fails; IPv6 tunnel routing is not supported.
 - UDP ASSOCIATE is explicitly rejected; proxied traffic is TCP-only.
+
+### Trusted DNS Scopes
+
+DNS Server lookup for otherwise unknown domains is limited to scopes inferred from the active route table. This prevents unrelated domains from being disclosed to VPN-provided DNS servers while retaining DNS-derived routing for related services.
+
+The scope inference algorithm:
+
+1. Builds a reverse-label trie from unique active TCP Rc domain rules, excluding IP rules, inactive protocols, and `dns.data`.
+2. Treats only terminal nodes without children as leaves.
+3. Collapses a subtree when a node has at least two direct leaf children, allowing the resulting synthetic leaf to merge recursively into its parent.
+4. Stops before one-label roots and retains only the final synthetic leaves, allowing scopes such as `edu.cn` but never a TLD such as `com`.
+
+For example, `pan.shiep.edu.cn + ids.shiep.edu.cn -> shiep.edu.cn`.
+
+An otherwise unknown domain may query route-table DNS only when it equals or is below an inferred scope. Exact Rc domain matches remain independent of this gate and may still query DNS when their local mapping is missing. Route-table `dns.data` records remain local resolution data and do not authorize broader DNS queries.
 
 Supported fallback proxy input formats:
 
