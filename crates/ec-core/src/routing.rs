@@ -3,10 +3,11 @@ use crate::route_table::{PortRange, RouteRule, RouteTable};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
-static ROUTER: OnceLock<Mutex<RouteMode>> = OnceLock::new();
+static ROUTER: OnceLock<RouteMode> = OnceLock::new();
 const ROUTER_NOT_INITIALIZED: &str = "route matcher is not initialized";
+const ROUTER_ALREADY_INITIALIZED: &str = "route matcher is already initialized";
 
 #[derive(Debug, Clone)]
 pub struct RouteInstallSummary {
@@ -66,33 +67,26 @@ pub fn install_route_table(table: RouteTable) -> EcResult<RouteInstallSummary> {
         dns_record_count: matcher.dns_records,
         dns_scope_count: matcher.trusted_dns_scopes.len(),
     };
-    let holder = ROUTER.get_or_init(|| Mutex::new(RouteMode::Unavailable));
-    let mut guard = holder
-        .lock()
-        .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
+    ROUTER
+        .set(RouteMode::Matcher(Box::new(matcher)))
+        .map_err(|_| EcError::Runtime(ROUTER_ALREADY_INITIALIZED.to_string()))?;
     crate::dns_resolver::clear_cache();
-    *guard = RouteMode::Matcher(Arc::new(matcher));
     Ok(summary)
 }
 
 pub fn install_tunnel_fallback() -> EcResult<()> {
-    let holder = ROUTER.get_or_init(|| Mutex::new(RouteMode::Unavailable));
-    let mut guard = holder
-        .lock()
-        .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
+    ROUTER
+        .set(RouteMode::TunnelFallback)
+        .map_err(|_| EcError::Runtime(ROUTER_ALREADY_INITIALIZED.to_string()))?;
     crate::dns_resolver::clear_cache();
-    *guard = RouteMode::TunnelFallback;
     Ok(())
 }
 
 pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
-    let holder = ROUTER
+    let mode = ROUTER
         .get()
         .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
-    let mode = holder
-        .lock()
-        .map_err(|_| EcError::Runtime("route matcher mutex poisoned".to_string()))?;
-    plan_from_mode(&mode, host, port)
+    plan_from_mode(mode, host, port)
 }
 
 fn plan_from_mode(mode: &RouteMode, host: &str, port: u16) -> EcResult<RoutePlan> {
@@ -108,14 +102,12 @@ fn plan_from_mode(mode: &RouteMode, host: &str, port: u16) -> EcResult<RoutePlan
                 dns_lookup: None,
             }),
         },
-        RouteMode::Unavailable => Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string())),
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum RouteMode {
-    Unavailable,
-    Matcher(Arc<RouteMatcher>),
+    Matcher(Box<RouteMatcher>),
     TunnelFallback,
 }
 
