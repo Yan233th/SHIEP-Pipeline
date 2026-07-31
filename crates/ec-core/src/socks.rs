@@ -206,7 +206,7 @@ fn route_decision_remote(
     };
     RouteDecision {
         line,
-        path: format!("remote -> {name}({dial}); source={}", source.describe()),
+        path: format!("remote -> {name}({dial}); source: {}", source.describe()),
         transport: RouteTransport::Tunnel(dial),
     }
 }
@@ -250,8 +250,8 @@ fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDeci
             "{target_display}{arrow}{}{arrow}route planner unavailable",
             output::route_label(RouteKind::Fallback),
         ),
-        path: format!("fallback -> unavailable; reason: route planner unavailable: {reason}"),
-        transport: RouteTransport::Unsupported("route planner unavailable".to_string()),
+        path: format!("fallback -> unavailable; reason: {reason}"),
+        transport: RouteTransport::Unsupported("no route transport available".to_string()),
     }
 }
 
@@ -424,7 +424,12 @@ fn is_ip_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_client, normalize_bind_addr, target_addr};
+    use super::{
+        handle_client, normalize_bind_addr, route_decision_planner_error, route_decision_remote,
+        target_addr,
+    };
+    use crate::error::EcError;
+    use crate::routing::RouteSource;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -442,6 +447,35 @@ mod tests {
     #[test]
     fn direct_fallback_keeps_ipv6_target_bracketed() {
         assert_eq!(target_addr("[2001:db8::1]:443"), "[2001:db8::1]:443");
+    }
+
+    #[test]
+    fn remote_error_path_uses_consistent_key_separator() {
+        let route = route_decision_remote(
+            "example.com:443",
+            false,
+            "192.0.2.1:443".to_string(),
+            "Example".to_string(),
+            RouteSource::DnsMap,
+        );
+
+        assert_eq!(
+            route.path,
+            "remote -> Example(192.0.2.1:443); source: dns-map"
+        );
+    }
+
+    #[test]
+    fn planner_error_path_does_not_repeat_planner_unavailable() {
+        let route = route_decision_planner_error(
+            "example.com:443",
+            EcError::Runtime("route matcher is not initialized".to_string()),
+        );
+
+        assert_eq!(
+            route.path,
+            "fallback -> unavailable; reason: route matcher is not initialized"
+        );
     }
 
     #[test]
