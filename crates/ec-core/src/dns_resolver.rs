@@ -2,6 +2,7 @@ use crate::error::{EcError, EcResult};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const DNS_IO_TIMEOUT: Duration = Duration::from_millis(1200);
 const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+const DNS_CACHE_CAPACITY: usize = 1024;
 const DNS_UDP_BUFFER_SIZE: usize = 4096;
 const DNS_TCP_MAX_PAYLOAD: usize = 65535;
 
@@ -364,6 +366,9 @@ fn cache_get(key: &CacheKey) -> Option<Ipv4Addr> {
 fn cache_put(key: CacheKey, ip: Ipv4Addr) {
     let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
+        prepare_cache_insert(&mut guard, &key, DNS_CACHE_CAPACITY, |entry| {
+            entry.expires_at
+        });
         guard.insert(
             key,
             CacheEntry {
@@ -394,6 +399,9 @@ fn lookup_cache_get(key: &str) -> Option<(Vec<String>, Vec<Ipv4Addr>)> {
 fn lookup_cache_put(key: String, aliases: Vec<String>, ips: Vec<Ipv4Addr>) {
     let cache = DNS_LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
+        prepare_cache_insert(&mut guard, &key, DNS_CACHE_CAPACITY, |entry| {
+            entry.expires_at
+        });
         guard.insert(
             key,
             LookupCacheEntry {
@@ -402,5 +410,94 @@ fn lookup_cache_put(key: String, aliases: Vec<String>, ips: Vec<Ipv4Addr>) {
                 expires_at: Instant::now() + DNS_CACHE_TTL,
             },
         );
+    }
+}
+
+fn prepare_cache_insert<K, V>(
+    cache: &mut HashMap<K, V>,
+    key: &K,
+    capacity: usize,
+    expires_at: impl Fn(&V) -> Instant,
+) where
+    K: Clone + Eq + Hash,
+{
+    let now = Instant::now();
+    cache.retain(|_, entry| expires_at(entry) > now);
+
+    if capacity == 0 {
+        cache.clear();
+        return;
+    }
+
+    cache.remove(key);
+    while cache.len() >= capacity {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| expires_at(entry))
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_cache_insert;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    struct TestEntry {
+        expires_at: Instant,
+    }
+
+    #[test]
+    fn cache_insert_prunes_expired_entries() {
+        let now = Instant::now();
+        let mut cache = HashMap::from([
+            (
+                "expired",
+                TestEntry {
+                    expires_at: now - Duration::from_secs(1),
+                },
+            ),
+            (
+                "live",
+                TestEntry {
+                    expires_at: now + Duration::from_secs(30),
+                },
+            ),
+        ]);
+
+        prepare_cache_insert(&mut cache, &"new", 3, |entry| entry.expires_at);
+
+        assert!(!cache.contains_key("expired"));
+        assert!(cache.contains_key("live"));
+    }
+
+    #[test]
+    fn cache_insert_evicts_the_earliest_expiring_entry() {
+        let now = Instant::now();
+        let mut cache = HashMap::from([
+            (
+                "oldest",
+                TestEntry {
+                    expires_at: now + Duration::from_secs(10),
+                },
+            ),
+            (
+                "newer",
+                TestEntry {
+                    expires_at: now + Duration::from_secs(20),
+                },
+            ),
+        ]);
+
+        prepare_cache_insert(&mut cache, &"new", 2, |entry| entry.expires_at);
+
+        assert!(!cache.contains_key("oldest"));
+        assert!(cache.contains_key("newer"));
     }
 }
