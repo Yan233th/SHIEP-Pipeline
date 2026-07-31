@@ -563,15 +563,31 @@ fn is_ip_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFailure, describe_route_source, handle_client, is_expected_relay_io_error,
-        is_retryable_accept_error, join_relay_worker, normalize_bind_addr,
-        route_decision_planner_error, route_decision_remote, target_addr,
+        ClientFailure, SOCKS_REP_SUCCEEDED, describe_route_source, handle_client,
+        is_expected_relay_io_error, is_retryable_accept_error, join_relay_worker,
+        normalize_bind_addr, route_decision_planner_error, route_decision_remote, target_addr,
     };
     use crate::error::EcError;
+    use crate::route_table::RouteTable;
     use crate::routing::RouteSource;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::sync::Once;
     use std::thread;
+    use std::time::Duration;
+
+    static TEST_ROUTER_INIT: Once = Once::new();
+
+    fn install_empty_test_router() {
+        TEST_ROUTER_INIT.call_once(|| {
+            crate::routing::install_route_table(RouteTable {
+                rules: vec![],
+                dns_servers: vec![],
+                dns_records: vec![],
+            })
+            .unwrap();
+        });
+    }
 
     #[test]
     fn normalize_bind_addr_expands_port_only() {
@@ -710,5 +726,68 @@ mod tests {
             server.join().unwrap(),
             Err(ClientFailure::Request(_))
         ));
+    }
+
+    #[test]
+    fn socks_connect_direct_fallback_relays_bidirectionally() {
+        install_empty_test_router();
+
+        let echo_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let echo_addr = match echo_listener.local_addr().unwrap() {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("expected ipv4 echo listener"),
+        };
+        let echo_server = thread::spawn(move || {
+            let (mut stream, _) = echo_listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                stream.write_all(&buf[..n]).unwrap();
+            }
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let socks_server = thread::spawn(move || {
+            let (stream, _) = socks_listener.accept().unwrap();
+            handle_client(stream, None)
+        });
+
+        let mut client = TcpStream::connect(socks_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut method_reply = [0u8; 2];
+        client.read_exact(&mut method_reply).unwrap();
+        assert_eq!(method_reply, [0x05, 0x00]);
+
+        let mut connect_request = vec![0x05, 0x01, 0x00, 0x01];
+        connect_request.extend_from_slice(&echo_addr.ip().octets());
+        connect_request.extend_from_slice(&echo_addr.port().to_be_bytes());
+        client.write_all(&connect_request).unwrap();
+        let mut connect_reply = [0u8; 10];
+        client.read_exact(&mut connect_reply).unwrap();
+        assert_eq!(connect_reply[1], SOCKS_REP_SUCCEEDED);
+
+        let payload = b"SHIEP-Pipeline relay test";
+        client.write_all(payload).unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).unwrap();
+        assert_eq!(echoed, payload);
+
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut trailing = Vec::new();
+        client.read_to_end(&mut trailing).unwrap();
+        assert!(trailing.is_empty());
+        assert!(socks_server.join().unwrap().is_ok());
+        echo_server.join().unwrap();
     }
 }
