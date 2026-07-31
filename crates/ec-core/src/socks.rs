@@ -119,13 +119,21 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
             rc_id: _,
             rc_name,
             source,
+            dns_lookup,
         }) => {
             let resolved_ip = dial
                 .rsplit_once(':')
                 .map(|(ip, _)| ip)
                 .unwrap_or(dial.as_str());
-            log_resolved_route_source(target.host(), resolved_ip, source);
-            route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source)
+            log_resolved_route_source(target.host(), resolved_ip, source, dns_lookup);
+            route_decision_remote(
+                target_display.as_str(),
+                target_is_ip,
+                dial,
+                rc_name,
+                source,
+                dns_lookup,
+            )
         }
         Ok(crate::routing::RoutePlan::Fallback {
             target: planned_target,
@@ -141,24 +149,25 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
     }
 }
 
-fn log_resolved_route_source(host: &str, resolved_ip: &str, source: crate::routing::RouteSource) {
+fn log_resolved_route_source(
+    host: &str,
+    resolved_ip: &str,
+    source: crate::routing::RouteSource,
+    dns_lookup: Option<crate::dns_resolver::ResolveSource>,
+) {
     let arrow = output::weak(" -> ");
-    match source {
-        crate::routing::RouteSource::DnsDataIpRule => {
-            output::info(
+    if let Some(dns_lookup) = dns_lookup {
+        match dns_lookup {
+            crate::dns_resolver::ResolveSource::Cache => output::info(
                 Scope::Upstream,
                 format_args!(
-                    "route dns.data resolved {}{}{}",
+                    "route DNS cache hit {}{}{}",
                     output::value(host),
                     arrow,
                     output::value(resolved_ip)
                 ),
-            );
-        }
-        crate::routing::RouteSource::DnsServerQuery(server)
-        | crate::routing::RouteSource::CnameDnsServerQuery(server)
-        | crate::routing::RouteSource::DnsServerIpRuleQuery(server) => {
-            output::info(
+            ),
+            crate::dns_resolver::ResolveSource::Server(server) => output::info(
                 Scope::Upstream,
                 format_args!(
                     "route DNS resolved {}{}{} via {}",
@@ -167,22 +176,21 @@ fn log_resolved_route_source(host: &str, resolved_ip: &str, source: crate::routi
                     output::value(resolved_ip),
                     output::value(server)
                 ),
-            );
+            ),
         }
-        crate::routing::RouteSource::DnsServerCache
-        | crate::routing::RouteSource::CnameDnsServerCache
-        | crate::routing::RouteSource::DnsServerIpRuleCache => {
-            output::info(
-                Scope::Upstream,
-                format_args!(
-                    "route DNS cache hit {}{}{}",
-                    output::value(host),
-                    arrow,
-                    output::value(resolved_ip)
-                ),
-            );
-        }
-        _ => {}
+        return;
+    }
+
+    if source == crate::routing::RouteSource::DnsDataIpRule {
+        output::info(
+            Scope::Upstream,
+            format_args!(
+                "route dns.data resolved {}{}{}",
+                output::value(host),
+                arrow,
+                output::value(resolved_ip)
+            ),
+        );
     }
 }
 
@@ -192,6 +200,7 @@ fn route_decision_remote(
     dial: String,
     rc_name: String,
     source: crate::routing::RouteSource,
+    dns_lookup: Option<crate::dns_resolver::ResolveSource>,
 ) -> RouteDecision {
     let arrow = output::weak(" -> ");
     let lparen = output::weak("(");
@@ -214,8 +223,52 @@ fn route_decision_remote(
     };
     RouteDecision {
         line,
-        path: format!("remote -> {name}({dial}); source: {}", source.describe()),
+        path: format!(
+            "remote -> {name}({dial}); source: {}",
+            describe_route_source(source, dns_lookup)
+        ),
         transport: RouteTransport::Tunnel(dial),
+    }
+}
+
+fn describe_route_source(
+    source: crate::routing::RouteSource,
+    dns_lookup: Option<crate::dns_resolver::ResolveSource>,
+) -> String {
+    match (source, dns_lookup) {
+        (
+            crate::routing::RouteSource::DnsServer,
+            Some(crate::dns_resolver::ResolveSource::Cache),
+        ) => "dns-cache".to_string(),
+        (
+            crate::routing::RouteSource::CnameDnsServer,
+            Some(crate::dns_resolver::ResolveSource::Cache),
+        ) => "cname-dns-cache".to_string(),
+        (
+            crate::routing::RouteSource::DnsServerIpRule,
+            Some(crate::dns_resolver::ResolveSource::Cache),
+        ) => "dns-server-ip-rule-cache".to_string(),
+        (
+            crate::routing::RouteSource::DnsServer,
+            Some(crate::dns_resolver::ResolveSource::Server(server)),
+        ) => {
+            format!("dns-server({server})")
+        }
+        (
+            crate::routing::RouteSource::CnameDnsServer,
+            Some(crate::dns_resolver::ResolveSource::Server(server)),
+        ) => format!("cname-dns-server({server})"),
+        (
+            crate::routing::RouteSource::DnsServerIpRule,
+            Some(crate::dns_resolver::ResolveSource::Server(server)),
+        ) => format!("dns-server-ip-rule({server})"),
+        (source, Some(crate::dns_resolver::ResolveSource::Cache)) => {
+            format!("{} via dns-cache", source.label())
+        }
+        (source, Some(crate::dns_resolver::ResolveSource::Server(server))) => {
+            format!("{} via dns-server({server})", source.label())
+        }
+        (source, None) => source.label().to_string(),
     }
 }
 
@@ -447,8 +500,8 @@ fn is_ip_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFailure, handle_client, normalize_bind_addr, route_decision_planner_error,
-        route_decision_remote, target_addr,
+        ClientFailure, describe_route_source, handle_client, normalize_bind_addr,
+        route_decision_planner_error, route_decision_remote, target_addr,
     };
     use crate::error::EcError;
     use crate::routing::RouteSource;
@@ -479,11 +532,25 @@ mod tests {
             "192.0.2.1:443".to_string(),
             "Example".to_string(),
             RouteSource::DnsMap,
+            None,
         );
 
         assert_eq!(
             route.path,
             "remote -> Example(192.0.2.1:443); source: dns-map"
+        );
+    }
+
+    #[test]
+    fn cname_dns_map_source_keeps_lookup_provenance() {
+        let server = "192.0.2.53:53".parse().unwrap();
+
+        assert_eq!(
+            describe_route_source(
+                RouteSource::CnameDnsMap,
+                Some(crate::dns_resolver::ResolveSource::Server(server))
+            ),
+            "cname-dns-map via dns-server(192.0.2.53:53)"
         );
     }
 

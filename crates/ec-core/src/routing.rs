@@ -23,6 +23,7 @@ pub enum RoutePlan {
         rc_id: i32,
         rc_name: String,
         source: RouteSource,
+        dns_lookup: Option<crate::dns_resolver::ResolveSource>,
     },
     Fallback {
         target: String,
@@ -36,13 +37,10 @@ pub enum RouteSource {
     RuleIp,
     DnsMap,
     DnsDataIpRule,
-    DnsServerCache,
-    DnsServerQuery(SocketAddr),
+    DnsServer,
     CnameDnsMap,
-    CnameDnsServerCache,
-    CnameDnsServerQuery(SocketAddr),
-    DnsServerIpRuleCache,
-    DnsServerIpRuleQuery(SocketAddr),
+    CnameDnsServer,
+    DnsServerIpRule,
 }
 
 impl RouteSource {
@@ -52,22 +50,10 @@ impl RouteSource {
             RouteSource::RuleIp => "rule-ip",
             RouteSource::DnsMap => "dns-map",
             RouteSource::DnsDataIpRule => "dns-data-ip-rule",
-            RouteSource::DnsServerCache => "dns-cache",
-            RouteSource::DnsServerQuery(_) => "dns-server",
+            RouteSource::DnsServer => "dns-server",
             RouteSource::CnameDnsMap => "cname-dns-map",
-            RouteSource::CnameDnsServerCache => "cname-dns-cache",
-            RouteSource::CnameDnsServerQuery(_) => "cname-dns-server",
-            RouteSource::DnsServerIpRuleCache => "dns-server-ip-rule-cache",
-            RouteSource::DnsServerIpRuleQuery(_) => "dns-server-ip-rule",
-        }
-    }
-
-    pub fn describe(self) -> String {
-        match self {
-            RouteSource::DnsServerQuery(server) => format!("dns-server({server})"),
-            RouteSource::CnameDnsServerQuery(server) => format!("cname-dns-server({server})"),
-            RouteSource::DnsServerIpRuleQuery(server) => format!("dns-server-ip-rule({server})"),
-            _ => self.label().to_string(),
+            RouteSource::CnameDnsServer => "cname-dns-server",
+            RouteSource::DnsServerIpRule => "dns-server-ip-rule",
         }
     }
 }
@@ -119,6 +105,7 @@ fn plan_from_mode(mode: &RouteMode, host: &str, port: u16) -> EcResult<RoutePlan
                 rc_id: 0,
                 rc_name: "route-table-unavailable".to_string(),
                 source: RouteSource::RouteTableUnavailable,
+                dns_lookup: None,
             }),
         },
         RouteMode::Unavailable => Err(EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string())),
@@ -250,6 +237,7 @@ impl RouteMatcher {
                 rc_id: rule.rc_id,
                 rc_name: rule.rc_name.clone(),
                 source: RouteSource::RuleIp,
+                dns_lookup: None,
             },
             TargetKind::Ipv6(ip) => plan_ipv6_fallback(*ip, port),
             TargetKind::Domain(domain) => {
@@ -264,6 +252,7 @@ impl RouteMatcher {
                         rc_id: rule.rc_id,
                         rc_name: rule.rc_name.clone(),
                         source: RouteSource::DnsMap,
+                        dns_lookup: None,
                     };
                 }
                 if self.dns_servers.is_empty() {
@@ -277,19 +266,13 @@ impl RouteMatcher {
                 match crate::dns_resolver::resolve_first_ipv4(rule.rc_id, domain, &self.dns_servers)
                 {
                     Ok(resolved) => {
-                        let source = match resolved.source {
-                            crate::dns_resolver::ResolveSource::Cache => {
-                                RouteSource::DnsServerCache
-                            }
-                            crate::dns_resolver::ResolveSource::Server(server) => {
-                                RouteSource::DnsServerQuery(server)
-                            }
-                        };
+                        let dns_lookup = resolved.source;
                         RoutePlan::Remote {
                             dial: format!("{}:{port}", resolved.ip),
                             rc_id: rule.rc_id,
                             rc_name: rule.rc_name.clone(),
-                            source,
+                            source: RouteSource::DnsServer,
+                            dns_lookup: Some(dns_lookup),
                         }
                     }
                     Err(err) => RoutePlan::Fallback {
@@ -306,7 +289,7 @@ impl RouteMatcher {
 
     fn plan_dns_data_ip_rule(&self, port: u16, domain: &str) -> Option<RoutePlan> {
         let ips = self.dns_exact.get(domain)?;
-        self.plan_from_resolved_ips(port, ips, RouteSource::DnsDataIpRule)
+        self.plan_from_resolved_ips(port, ips, RouteSource::DnsDataIpRule, None)
     }
 
     fn plan_dnsserver_derived_rules(
@@ -319,16 +302,18 @@ impl RouteMatcher {
             return None;
         }
         let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
-        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved.aliases) {
+        if let Some(plan) =
+            self.plan_from_cname_aliases(host, port, &resolved.aliases, resolved.source)
+        {
             return Some(plan);
         }
-        let source = match resolved.source {
-            crate::dns_resolver::ResolveSource::Cache => RouteSource::DnsServerIpRuleCache,
-            crate::dns_resolver::ResolveSource::Server(server) => {
-                RouteSource::DnsServerIpRuleQuery(server)
-            }
-        };
-        self.plan_from_resolved_ips(port, &resolved.ips, source)
+        let dns_lookup = resolved.source;
+        self.plan_from_resolved_ips(
+            port,
+            &resolved.ips,
+            RouteSource::DnsServerIpRule,
+            Some(dns_lookup),
+        )
     }
 
     fn plan_from_cname_aliases(
@@ -336,6 +321,7 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         aliases: &[String],
+        dns_lookup: crate::dns_resolver::ResolveSource,
     ) -> Option<RoutePlan> {
         for alias in aliases {
             let alias = normalize_domain(alias);
@@ -344,7 +330,10 @@ impl RouteMatcher {
             }
             let target = TargetKind::Domain(alias);
             if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
-                return Some(self.plan_remote_with_cname_rule(rule, host, port, &target));
+                return Some(
+                    self.plan_remote_with_cname_rule(rule, host, port, &target)
+                        .with_dns_lookup_if_absent(dns_lookup),
+                );
             }
         }
         None
@@ -368,6 +357,7 @@ impl RouteMatcher {
         port: u16,
         ips: &[Ipv4Addr],
         source: RouteSource,
+        dns_lookup: Option<crate::dns_resolver::ResolveSource>,
     ) -> Option<RoutePlan> {
         for ip in ips {
             let target = TargetKind::Ipv4(*ip);
@@ -377,6 +367,7 @@ impl RouteMatcher {
                     rc_id: rule.rc_id,
                     rc_name: rule.rc_name.clone(),
                     source,
+                    dns_lookup,
                 });
             }
         }
@@ -396,14 +387,27 @@ impl RouteMatcher {
                 rc_id,
                 rc_name,
                 source,
+                dns_lookup,
             } => RoutePlan::Remote {
                 dial,
                 rc_id,
                 rc_name,
                 source: cname_route_source(source),
+                dns_lookup,
             },
             other => other,
         }
+    }
+}
+
+impl RoutePlan {
+    fn with_dns_lookup_if_absent(mut self, source: crate::dns_resolver::ResolveSource) -> Self {
+        if let Self::Remote { dns_lookup, .. } = &mut self
+            && dns_lookup.is_none()
+        {
+            *dns_lookup = Some(source);
+        }
+        self
     }
 }
 
@@ -481,8 +485,7 @@ fn infer_trusted_dns_scopes<'a>(domains: impl IntoIterator<Item = &'a str>) -> H
 fn cname_route_source(source: RouteSource) -> RouteSource {
     match source {
         RouteSource::DnsMap => RouteSource::CnameDnsMap,
-        RouteSource::DnsServerCache => RouteSource::CnameDnsServerCache,
-        RouteSource::DnsServerQuery(server) => RouteSource::CnameDnsServerQuery(server),
+        RouteSource::DnsServer => RouteSource::CnameDnsServer,
         other => other,
     }
 }
@@ -785,11 +788,13 @@ mod tests {
                 dial,
                 rc_id,
                 source,
+                dns_lookup,
                 ..
             } => {
                 assert_eq!(dial, "10.166.35.11:443");
                 assert_eq!(rc_id, 205);
                 assert_eq!(source, RouteSource::DnsMap);
+                assert_eq!(dns_lookup, None);
             }
             _ => panic!("expected remote plan"),
         }
@@ -886,6 +891,7 @@ mod tests {
                 rc_id,
                 rc_name,
                 source,
+                ..
             } => {
                 assert_eq!(dial, "example.invalid:443");
                 assert_eq!(rc_id, 0);
@@ -1078,6 +1084,7 @@ mod tests {
                 "estudent.shiep.edu.cn",
                 443,
                 &["lgwf0-46.shiep.edu.cn".to_string()],
+                crate::dns_resolver::ResolveSource::Server("127.0.0.1:53".parse().unwrap()),
             )
             .unwrap();
         match plan {
@@ -1085,11 +1092,18 @@ mod tests {
                 dial,
                 rc_id,
                 source,
+                dns_lookup,
                 ..
             } => {
                 assert_eq!(dial, "10.166.64.6:443");
                 assert_eq!(rc_id, 150);
                 assert_eq!(source, RouteSource::CnameDnsMap);
+                assert_eq!(
+                    dns_lookup,
+                    Some(crate::dns_resolver::ResolveSource::Server(
+                        "127.0.0.1:53".parse().unwrap()
+                    ))
+                );
             }
             _ => panic!("expected remote plan"),
         }
@@ -1117,8 +1131,30 @@ mod tests {
             "estudent.shiep.edu.cn",
             443,
             &["10.166.64.6".to_string()],
+            crate::dns_resolver::ResolveSource::Cache,
         );
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn cname_lookup_does_not_replace_a_more_direct_dns_source() {
+        let inner_server = "192.0.2.53:53".parse().unwrap();
+        let plan = RoutePlan::Remote {
+            dial: "10.166.64.6:443".to_string(),
+            rc_id: 150,
+            rc_name: "SUEP-WAF".to_string(),
+            source: RouteSource::CnameDnsServer,
+            dns_lookup: Some(crate::dns_resolver::ResolveSource::Server(inner_server)),
+        }
+        .with_dns_lookup_if_absent(crate::dns_resolver::ResolveSource::Cache);
+
+        match plan {
+            RoutePlan::Remote { dns_lookup, .. } => assert_eq!(
+                dns_lookup,
+                Some(crate::dns_resolver::ResolveSource::Server(inner_server))
+            ),
+            _ => panic!("expected remote plan"),
+        }
     }
 
     #[test]
@@ -1138,7 +1174,12 @@ mod tests {
         let matcher = RouteMatcher::from_table(table).unwrap();
         let ips = vec!["10.50.2.206".parse().unwrap()];
         let plan = matcher
-            .plan_from_resolved_ips(80, &ips, RouteSource::DnsServerIpRuleCache)
+            .plan_from_resolved_ips(
+                80,
+                &ips,
+                RouteSource::DnsServerIpRule,
+                Some(crate::dns_resolver::ResolveSource::Cache),
+            )
             .unwrap();
         match plan {
             RoutePlan::Remote {
@@ -1149,7 +1190,7 @@ mod tests {
             } => {
                 assert_eq!(dial, "10.50.2.206:80");
                 assert_eq!(rc_id, 302);
-                assert_eq!(source, RouteSource::DnsServerIpRuleCache);
+                assert_eq!(source, RouteSource::DnsServerIpRule);
             }
             _ => panic!("expected remote plan"),
         }
