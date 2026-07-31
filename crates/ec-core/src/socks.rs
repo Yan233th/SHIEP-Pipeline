@@ -52,7 +52,7 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
             let (stream, _peer) = match listener.accept() {
                 Ok(v) => v,
                 Err(err) => {
-                    output::warn(Scope::Req, format_args!("accept failed: {err}"));
+                    output::warn(Scope::App, format_args!("listener accept failed: {err}"));
                     continue;
                 }
             };

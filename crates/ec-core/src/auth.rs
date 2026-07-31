@@ -40,7 +40,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
         extract_tag(&login_auth_body, "RSA_ENCRYPT_EXP").unwrap_or_else(|| "65537".to_string());
     let csrf = extract_tag(&login_auth_body, "CSRF_RAND_CODE").unwrap_or_default();
     if csrf.is_empty() {
-        output::info(Scope::Login, "CSRF code missing; using legacy auth flow");
+        output::warn(Scope::Login, "CSRF code missing; using legacy auth flow");
     }
 
     let password_input = if csrf.is_empty() {

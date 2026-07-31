@@ -269,7 +269,7 @@ impl RouteMatcher {
                 if self.dns_servers.is_empty() {
                     return RoutePlan::Fallback {
                         target: format!("{host}:{port}"),
-                        reason: "hostname matched a route rule but dns map is missing and DNS servers are unavailable"
+                        reason: "hostname matched a route rule but dns.data entry is missing and DNS servers are unavailable"
                             .to_string(),
                     };
                 }
@@ -295,7 +295,7 @@ impl RouteMatcher {
                     Err(err) => RoutePlan::Fallback {
                         target: format!("{host}:{port}"),
                         reason: format!(
-                            "hostname matched a route rule but dns map is missing and DNS lookup failed: {}",
+                            "hostname matched a route rule but dns.data entry is missing and DNS lookup failed: {}",
                             crate::error::concise_error(err)
                         ),
                     },
