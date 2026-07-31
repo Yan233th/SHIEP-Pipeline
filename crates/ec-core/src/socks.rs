@@ -97,7 +97,7 @@ fn reject_udp_associate(client: &mut TcpStream) -> EcResult<()> {
     write_reply(client, SOCKS_REP_CMD_NOT_SUPPORTED)?;
     output::warn(
         Scope::Req,
-        "UDP ASSOCIATE rejected: UDP tunnel transport is not supported",
+        "UDP ASSOCIATE rejected: listener supports TCP CONNECT only",
     );
     Ok(())
 }
@@ -108,7 +108,7 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
     match crate::routing::plan_target(target.host(), target.port()) {
         Ok(crate::routing::RoutePlan::Remote {
             dial,
-            rc_id,
+            rc_id: _,
             rc_name,
             source,
         }) => {
@@ -116,7 +116,7 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
                 .rsplit_once(':')
                 .map(|(ip, _)| ip)
                 .unwrap_or(dial.as_str());
-            log_resolved_route_source(target.host(), resolved_ip, rc_id, source);
+            log_resolved_route_source(target.host(), resolved_ip, source);
             route_decision_remote(target_display.as_str(), target_is_ip, dial, rc_name, source)
         }
         Ok(crate::routing::RoutePlan::Fallback {
@@ -133,23 +133,17 @@ fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) 
     }
 }
 
-fn log_resolved_route_source(
-    host: &str,
-    resolved_ip: &str,
-    rc_id: i32,
-    source: crate::routing::RouteSource,
-) {
+fn log_resolved_route_source(host: &str, resolved_ip: &str, source: crate::routing::RouteSource) {
     let arrow = output::weak(" -> ");
     match source {
         crate::routing::RouteSource::DnsDataIpRule => {
             output::info(
                 Scope::Upstream,
                 format_args!(
-                    "dns.data resolved {}{}{} for rc_id={}",
+                    "route dns.data resolved {}{}{}",
                     output::value(host),
                     arrow,
-                    output::value(resolved_ip),
-                    output::value(rc_id)
+                    output::value(resolved_ip)
                 ),
             );
         }
@@ -159,12 +153,11 @@ fn log_resolved_route_source(
             output::info(
                 Scope::Upstream,
                 format_args!(
-                    "dnsserver resolved {}{}{} via {} for rc_id={}",
+                    "route DNS resolved {}{}{} via {}",
                     output::value(host),
                     arrow,
                     output::value(resolved_ip),
-                    output::value(server),
-                    output::value(rc_id)
+                    output::value(server)
                 ),
             );
         }
@@ -174,11 +167,10 @@ fn log_resolved_route_source(
             output::info(
                 Scope::Upstream,
                 format_args!(
-                    "dns cache hit {}{}{} for rc_id={}",
+                    "route DNS cache hit {}{}{}",
                     output::value(host),
                     arrow,
-                    output::value(resolved_ip),
-                    output::value(rc_id)
+                    output::value(resolved_ip)
                 ),
             );
         }

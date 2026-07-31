@@ -86,7 +86,7 @@ impl EasyConnectApp {
         output::success(
             Scope::Protocol,
             format_args!(
-                "assigned IP: {}; LAN IP: {}",
+                "assigned IP: {}; heartbeat target: {}",
                 output::value(Ipv4Addr::from(tunnel_ips.assigned_ip)),
                 output::value(Ipv4Addr::from(tunnel_ips.lan_ip))
             ),
