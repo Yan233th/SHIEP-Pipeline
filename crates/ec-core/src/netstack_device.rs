@@ -50,7 +50,7 @@ impl TxToken for TunnelTxToken {
             let detail = crate::error::concise_error(err);
             if detail.contains("sending on a closed channel") {
                 if !CLOSED_TUNNEL_WARNED.swap(true, Ordering::Relaxed) {
-                    if let Some(reason) = crate::protocol::tunnel_fatal_reason() {
+                    if let Some(reason) = crate::runtime_state::fatal_reason() {
                         output::warn(
                             Scope::Netstack,
                             format_args!(

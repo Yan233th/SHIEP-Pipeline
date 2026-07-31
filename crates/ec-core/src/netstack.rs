@@ -49,7 +49,7 @@ pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
         if let Err(err) = run_netstack_loop(assigned_ip, control_rx) {
             let detail = format!("netstack closed: {}", crate::error::concise_error(err));
             output::error(Scope::Netstack, &detail);
-            crate::protocol::record_runtime_fatal(detail);
+            crate::runtime_state::record_fatal(detail);
         }
     });
 

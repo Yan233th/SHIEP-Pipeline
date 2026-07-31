@@ -5,7 +5,7 @@ use crate::socks_wire::{
     ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_SUCCEEDED, SocksCommand,
     format_socket_target, negotiate_method, read_socks_request, write_reply,
 };
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 
@@ -19,8 +19,8 @@ pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     log_socks_startup(normalized.as_str(), fallback_proxy.as_ref());
     spawn_accept_loop(listener, fallback_proxy.clone());
 
-    let _reason = crate::protocol::wait_tunnel_fatal_reason();
-    Err(EcError::Runtime("tunnel closed".to_string()))
+    let _reason = crate::runtime_state::wait_fatal_reason();
+    Err(EcError::Runtime("runtime closed".to_string()))
 }
 
 fn normalize_bind_addr(bind_addr: &str) -> String {
@@ -51,9 +51,12 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
         loop {
             let (stream, _peer) = match listener.accept() {
                 Ok(v) => v,
+                Err(err) if is_retryable_accept_error(&err) => continue,
                 Err(err) => {
-                    output::warn(Scope::App, format_args!("listener accept failed: {err}"));
-                    continue;
+                    let detail = format!("listener closed: {err}");
+                    output::error(Scope::App, &detail);
+                    crate::runtime_state::record_fatal(detail);
+                    return;
                 }
             };
             let fallback_proxy = fallback_proxy.clone();
@@ -65,6 +68,13 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
             });
         }
     });
+}
+
+fn is_retryable_accept_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::Interrupted | ErrorKind::ConnectionAborted | ErrorKind::ConnectionReset
+    )
 }
 
 fn handle_client(
@@ -500,8 +510,8 @@ fn is_ip_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFailure, describe_route_source, handle_client, normalize_bind_addr,
-        route_decision_planner_error, route_decision_remote, target_addr,
+        ClientFailure, describe_route_source, handle_client, is_retryable_accept_error,
+        normalize_bind_addr, route_decision_planner_error, route_decision_remote, target_addr,
     };
     use crate::error::EcError;
     use crate::routing::RouteSource;
@@ -517,6 +527,19 @@ mod tests {
     #[test]
     fn normalize_bind_addr_keeps_explicit_host() {
         assert_eq!(normalize_bind_addr("127.0.0.1:1080"), "127.0.0.1:1080");
+    }
+
+    #[test]
+    fn listener_retries_only_transient_accept_errors() {
+        assert!(is_retryable_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::Interrupted
+        )));
+        assert!(is_retryable_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionAborted
+        )));
+        assert!(!is_retryable_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::Other
+        )));
     }
 
     #[test]

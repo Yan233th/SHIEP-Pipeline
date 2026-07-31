@@ -11,7 +11,7 @@ use crate::protocol_wire::{
 use openssl::ssl::SslStream;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Condvar, Mutex, OnceLock, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -272,13 +272,6 @@ static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 // heartbeat must stay on that same stream instead of the RX/TX data streams.
 static COMMAND_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
-static TUNNEL_FATAL_STATE: OnceLock<TunnelFatalState> = OnceLock::new();
-
-struct TunnelFatalState {
-    reason: Mutex<Option<String>>,
-    cv: Condvar,
-}
-
 pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamInit> {
     let (authority, host) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
@@ -287,7 +280,7 @@ pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamI
 }
 
 pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResult<()> {
-    clear_tunnel_fatal_reason();
+    crate::runtime_state::clear_fatal_reason();
 
     let (authority, host) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
@@ -377,52 +370,6 @@ pub fn take_tunnel_packet_receiver() -> EcResult<mpsc::Receiver<Vec<u8>>> {
     })
 }
 
-pub(crate) fn tunnel_fatal_reason() -> Option<String> {
-    let state = tunnel_fatal_state();
-    match state.reason.lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => Some("tunnel fatal reason mutex poisoned".to_string()),
-    }
-}
-
-pub(crate) fn wait_tunnel_fatal_reason() -> String {
-    let state = tunnel_fatal_state();
-    let mut guard = match state.reason.lock() {
-        Ok(guard) => guard,
-        Err(_) => return "tunnel fatal reason mutex poisoned".to_string(),
-    };
-    loop {
-        if let Some(reason) = guard.as_ref() {
-            return reason.clone();
-        }
-        guard = match state.cv.wait(guard) {
-            Ok(guard) => guard,
-            Err(_) => return "tunnel fatal reason condvar wait poisoned".to_string(),
-        };
-    }
-}
-
-pub(crate) fn record_runtime_fatal(reason: impl Into<String>) {
-    record_tunnel_fatal_reason(reason.into());
-}
-
-fn clear_tunnel_fatal_reason() {
-    let state = tunnel_fatal_state();
-    if let Ok(mut guard) = state.reason.lock() {
-        *guard = None;
-    }
-}
-
-fn record_tunnel_fatal_reason(reason: String) {
-    let state = tunnel_fatal_state();
-    if let Ok(mut guard) = state.reason.lock()
-        && guard.is_none()
-    {
-        *guard = Some(reason);
-        state.cv.notify_all();
-    }
-}
-
 fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
     match result {
         Ok(()) => format!(
@@ -440,14 +387,7 @@ fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
 fn handle_worker_exit(profile: StreamProfile, result: EcResult<()>) {
     let detail = worker_exit_detail(profile, result);
     output::warn(Scope::Protocol, &detail);
-    record_tunnel_fatal_reason(detail);
-}
-
-fn tunnel_fatal_state() -> &'static TunnelFatalState {
-    TUNNEL_FATAL_STATE.get_or_init(|| TunnelFatalState {
-        reason: Mutex::new(None),
-        cv: Condvar::new(),
-    })
+    crate::runtime_state::record_fatal(detail);
 }
 
 fn open_command_stream_once(
@@ -905,7 +845,7 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
                 crate::error::concise_error(err)
             );
             output::warn(Scope::Protocol, &detail);
-            record_tunnel_fatal_reason(detail);
+            crate::runtime_state::record_fatal(detail);
         }
     });
 }

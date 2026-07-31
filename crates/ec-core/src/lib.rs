@@ -13,6 +13,7 @@ mod protocol_session;
 mod protocol_wire;
 mod route_table;
 mod routing;
+mod runtime_state;
 mod socks;
 mod socks_proxy;
 mod socks_wire;
