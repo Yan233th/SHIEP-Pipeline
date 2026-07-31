@@ -58,26 +58,34 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
             };
             let fallback_proxy = fallback_proxy.clone();
             thread::spawn(move || {
-                if let Err(err) = handle_client(stream, fallback_proxy.as_ref()) {
-                    output::error(Scope::Upstream, crate::error::concise_error(err));
+                if let Err(failure) = handle_client(stream, fallback_proxy.as_ref()) {
+                    let (scope, err) = failure.into_log_parts();
+                    output::error(scope, crate::error::concise_error(err));
                 }
             });
         }
     });
 }
 
-fn handle_client(mut client: TcpStream, fallback_proxy: Option<&FallbackProxy>) -> EcResult<()> {
-    negotiate_method(&mut client)?;
-    let request = read_socks_request(&mut client)?;
+fn handle_client(
+    mut client: TcpStream,
+    fallback_proxy: Option<&FallbackProxy>,
+) -> Result<(), ClientFailure> {
+    negotiate_method(&mut client).map_err(ClientFailure::Request)?;
+    let request = read_socks_request(&mut client).map_err(ClientFailure::Request)?;
     match request.command {
-        SocksCommand::Connect => handle_connect(client, request.target, fallback_proxy),
-        SocksCommand::UdpAssociate => reject_udp_associate(&mut client),
+        SocksCommand::Connect => {
+            handle_connect(client, request.target, fallback_proxy).map_err(ClientFailure::Upstream)
+        }
+        SocksCommand::UdpAssociate => {
+            reject_udp_associate(&mut client).map_err(ClientFailure::Request)
+        }
         SocksCommand::Other(_) => {
             let _ = write_reply(&mut client, SOCKS_REP_CMD_NOT_SUPPORTED);
-            Err(EcError::Runtime(format!(
+            Err(ClientFailure::Request(EcError::Runtime(format!(
                 "unsupported socks command: {}",
                 request.command
-            )))
+            ))))
         }
     }
 }
@@ -411,6 +419,20 @@ struct RouteDecision {
     transport: RouteTransport,
 }
 
+enum ClientFailure {
+    Request(EcError),
+    Upstream(EcError),
+}
+
+impl ClientFailure {
+    fn into_log_parts(self) -> (Scope, EcError) {
+        match self {
+            Self::Request(err) => (Scope::Req, err),
+            Self::Upstream(err) => (Scope::Upstream, err),
+        }
+    }
+}
+
 fn target_addr(target: &str) -> String {
     if let Some((host, port)) = target.rsplit_once(':') {
         return format_socket_target(host, port);
@@ -425,8 +447,8 @@ fn is_ip_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_client, normalize_bind_addr, route_decision_planner_error, route_decision_remote,
-        target_addr,
+        ClientFailure, handle_client, normalize_bind_addr, route_decision_planner_error,
+        route_decision_remote, target_addr,
     };
     use crate::error::EcError;
     use crate::routing::RouteSource;
@@ -500,5 +522,23 @@ mod tests {
         client.read_exact(&mut command_reply).unwrap();
         assert_eq!(command_reply[1], 0x07);
         assert!(server.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn invalid_socks_handshake_is_a_request_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_client(stream, None)
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(&[0x04, 0x00]).unwrap();
+
+        assert!(matches!(
+            server.join().unwrap(),
+            Err(ClientFailure::Request(_))
+        ));
     }
 }
