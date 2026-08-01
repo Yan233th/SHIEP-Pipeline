@@ -570,6 +570,7 @@ mod tests {
     use crate::error::EcError;
     use crate::route_table::RouteTable;
     use crate::routing::RouteSource;
+    use crate::socks_proxy::parse_fallback_proxy;
     use std::io::{Read, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::sync::Once;
@@ -587,6 +588,195 @@ mod tests {
             })
             .unwrap();
         });
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestProxyKind {
+        Socks5,
+        Http,
+    }
+
+    impl TestProxyKind {
+        fn scheme(self) -> &'static str {
+            match self {
+                Self::Socks5 => "socks5h",
+                Self::Http => "http",
+            }
+        }
+    }
+
+    fn spawn_echo_server() -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                stream.write_all(&buf[..n]).unwrap();
+            }
+            stream.shutdown(Shutdown::Write).unwrap();
+        });
+        (addr, worker)
+    }
+
+    fn relay_test_proxy(client: TcpStream, upstream: TcpStream) {
+        let mut client_reader = client.try_clone().unwrap();
+        let mut upstream_writer = upstream.try_clone().unwrap();
+        let mut upstream_reader = upstream;
+        let mut client_writer = client;
+
+        let uplink = thread::spawn(move || {
+            std::io::copy(&mut client_reader, &mut upstream_writer).unwrap();
+            upstream_writer.shutdown(Shutdown::Write).unwrap();
+        });
+        std::io::copy(&mut upstream_reader, &mut client_writer).unwrap();
+        client_writer.shutdown(Shutdown::Write).unwrap();
+        uplink.join().unwrap();
+    }
+
+    fn read_http_connect_head(stream: &mut TcpStream) -> String {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+            assert!(head.len() <= 4096, "HTTP CONNECT head is too large");
+            if head.ends_with(b"\r\n\r\n") {
+                return String::from_utf8(head).unwrap();
+            }
+        }
+    }
+
+    fn negotiate_test_socks5_proxy(stream: &mut TcpStream, host: &str, port: u16) {
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [0x05, 0x01, 0x00]);
+        stream.write_all(&[0x05, 0x00]).unwrap();
+
+        let mut request_head = [0u8; 4];
+        stream.read_exact(&mut request_head).unwrap();
+        assert_eq!(request_head, [0x05, 0x01, 0x00, 0x03]);
+        let mut host_len = [0u8; 1];
+        stream.read_exact(&mut host_len).unwrap();
+        let mut encoded_host = vec![0u8; host_len[0] as usize];
+        stream.read_exact(&mut encoded_host).unwrap();
+        let mut encoded_port = [0u8; 2];
+        stream.read_exact(&mut encoded_port).unwrap();
+        assert_eq!(encoded_host, host.as_bytes());
+        assert_eq!(u16::from_be_bytes(encoded_port), port);
+
+        stream
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+            .unwrap();
+    }
+
+    fn negotiate_test_http_proxy(stream: &mut TcpStream, host: &str, port: u16) {
+        let head = read_http_connect_head(stream);
+        let authority = format!("{host}:{port}");
+        assert!(head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")));
+        assert!(head.contains(&format!("\r\nHost: {authority}\r\n")));
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+    }
+
+    fn spawn_test_proxy(
+        kind: TestProxyKind,
+        target_addr: SocketAddr,
+        expected_host: &'static str,
+        expected_port: u16,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            match kind {
+                TestProxyKind::Socks5 => {
+                    negotiate_test_socks5_proxy(&mut client, expected_host, expected_port)
+                }
+                TestProxyKind::Http => {
+                    negotiate_test_http_proxy(&mut client, expected_host, expected_port)
+                }
+            }
+
+            let target = TcpStream::connect(target_addr).unwrap();
+            relay_test_proxy(client, target);
+        });
+        (addr, worker)
+    }
+
+    fn connect_test_socks_client(
+        socks_addr: SocketAddr,
+        target_host: &str,
+        target_port: u16,
+    ) -> TcpStream {
+        let mut client = TcpStream::connect(socks_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).unwrap();
+        let mut method_reply = [0u8; 2];
+        client.read_exact(&mut method_reply).unwrap();
+        assert_eq!(method_reply, [0x05, 0x00]);
+
+        let host = target_host.as_bytes();
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        request.extend_from_slice(host);
+        request.extend_from_slice(&target_port.to_be_bytes());
+        client.write_all(&request).unwrap();
+        let mut connect_reply = [0u8; 10];
+        client.read_exact(&mut connect_reply).unwrap();
+        assert_eq!(connect_reply[1], SOCKS_REP_SUCCEEDED);
+        client
+    }
+
+    fn assert_proxy_fallback_relays_bidirectionally(kind: TestProxyKind) {
+        const TARGET_HOST: &str = "fallback.test";
+        const TARGET_PORT: u16 = 443;
+
+        install_empty_test_router();
+        let (target_addr, target_server) = spawn_echo_server();
+        let (proxy_addr, proxy_server) =
+            spawn_test_proxy(kind, target_addr, TARGET_HOST, TARGET_PORT);
+        let proxy_url = format!("{}://{proxy_addr}", kind.scheme());
+        let proxy = parse_fallback_proxy(Some(proxy_url.as_str()))
+            .unwrap()
+            .unwrap();
+
+        let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let socks_server = thread::spawn(move || {
+            let (stream, _) = socks_listener.accept().unwrap();
+            handle_client(stream, Some(&proxy))
+        });
+
+        let mut client = connect_test_socks_client(socks_addr, TARGET_HOST, TARGET_PORT);
+        let payload = b"fallback proxy relay test";
+        client.write_all(payload).unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).unwrap();
+        assert_eq!(echoed, payload);
+
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut trailing = Vec::new();
+        client.read_to_end(&mut trailing).unwrap();
+        assert!(trailing.is_empty());
+        assert!(socks_server.join().unwrap().is_ok());
+        proxy_server.join().unwrap();
+        target_server.join().unwrap();
     }
 
     #[test]
@@ -789,5 +979,15 @@ mod tests {
         assert!(trailing.is_empty());
         assert!(socks_server.join().unwrap().is_ok());
         echo_server.join().unwrap();
+    }
+
+    #[test]
+    fn socks_connect_socks5_fallback_relays_bidirectionally() {
+        assert_proxy_fallback_relays_bidirectionally(TestProxyKind::Socks5);
+    }
+
+    #[test]
+    fn socks_connect_http_fallback_relays_bidirectionally() {
+        assert_proxy_fallback_relays_bidirectionally(TestProxyKind::Http);
     }
 }
