@@ -1,3 +1,5 @@
+
+
 # SHIEP-Pipeline
 
 SHIEP-Pipeline is a **Rust CLI-only** EasyConnect implementation for SHIEP.
@@ -62,7 +64,7 @@ SHIEP-Pipeline still performs its own route-table based split-routing after traf
 
 ## CLI Arguments
 
-- `--server` required, VPN server address
+- `--server` required, VPN server address (`host`, `host:port`, or `https://host[:port]`); default port `443`
 - `--username` required, username
 - `SHIEP_PIPELINE_PASSWORD` required unless `--password` is provided
 - `--password` optional, VPN password; usable as an alternative to `SHIEP_PIPELINE_PASSWORD`, but not recommended because process arguments may be visible
