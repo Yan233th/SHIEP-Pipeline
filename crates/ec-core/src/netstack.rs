@@ -491,7 +491,43 @@ fn smol_now(start: Instant) -> SmolInstant {
 
 #[cfg(test)]
 mod tests {
-    use super::{alloc_local_port, netstack_random_seed};
+    use super::{
+        ControlMessage, PendingSend, TunnelTcpSender, alloc_local_port, netstack_random_seed,
+    };
+    use crate::error::{EcError, EcResult, concise_error};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const TEST_CONN_ID: u64 = 7;
+
+    fn test_sender() -> (
+        TunnelTcpSender,
+        mpsc::Receiver<ControlMessage>,
+        mpsc::Sender<EcResult<()>>,
+    ) {
+        let (control_tx, control_rx) = mpsc::channel();
+        let (send_result_tx, send_result_rx) = mpsc::channel();
+        (
+            TunnelTcpSender {
+                id: TEST_CONN_ID,
+                control_tx,
+                send_result_rx,
+            },
+            control_rx,
+            send_result_tx,
+        )
+    }
+
+    fn recv_send(control_rx: &mpsc::Receiver<ControlMessage>, expected: &[u8]) {
+        match control_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ControlMessage::Send { id, data } => {
+                assert_eq!(id, TEST_CONN_ID);
+                assert_eq!(data, expected);
+            }
+            _ => panic!("expected tunnel payload"),
+        }
+    }
 
     #[test]
     fn alloc_local_port_wraps_after_60000() {
@@ -505,5 +541,104 @@ mod tests {
     #[test]
     fn random_seed_is_non_zero() {
         assert_ne!(netstack_random_seed(), 0);
+    }
+
+    #[test]
+    fn sender_waits_for_payload_admission() {
+        let (sender, control_rx, send_result_tx) = test_sender();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            done_tx.send(sender.send(vec![1, 2, 3])).unwrap();
+        });
+
+        recv_send(&control_rx, &[1, 2, 3]);
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        send_result_tx.send(Ok(())).unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn sender_serializes_payloads_and_close_after_admission() {
+        let (sender, control_rx, send_result_tx) = test_sender();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = sender
+                .send(vec![1])
+                .and_then(|()| sender.send(vec![2]))
+                .and_then(|()| sender.close());
+            done_tx.send(result).unwrap();
+        });
+
+        recv_send(&control_rx, &[1]);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        send_result_tx.send(Ok(())).unwrap();
+
+        recv_send(&control_rx, &[2]);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        send_result_tx.send(Ok(())).unwrap();
+
+        match control_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ControlMessage::Close { id } => assert_eq!(id, TEST_CONN_ID),
+            _ => panic!("expected tunnel close"),
+        }
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn sender_propagates_payload_admission_failure() {
+        let (sender, control_rx, send_result_tx) = test_sender();
+        let worker = thread::spawn(move || sender.send(vec![1]));
+
+        recv_send(&control_rx, &[1]);
+        send_result_tx
+            .send(Err(EcError::Runtime("tcp send buffer closed".to_string())))
+            .unwrap();
+
+        let err = worker.join().unwrap().unwrap_err();
+        assert_eq!(concise_error(err), "tcp send buffer closed");
+    }
+
+    #[test]
+    fn sender_wakes_when_admission_channel_closes() {
+        let (sender, control_rx, send_result_tx) = test_sender();
+        let worker = thread::spawn(move || sender.send(vec![1]));
+
+        recv_send(&control_rx, &[1]);
+        drop(send_result_tx);
+
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(concise_error(err).starts_with("wait tcp payload admission failed:"));
+    }
+
+    #[test]
+    fn pending_send_tracks_partial_admission() {
+        let mut pending = PendingSend::new(vec![1, 2, 3, 4]);
+
+        pending.advance(2);
+        assert_eq!(pending.remaining(), &[3, 4]);
+        assert!(!pending.is_complete());
+
+        pending.advance(2);
+        assert!(pending.remaining().is_empty());
+        assert!(pending.is_complete());
     }
 }
