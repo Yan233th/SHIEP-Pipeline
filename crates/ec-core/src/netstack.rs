@@ -5,7 +5,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -63,7 +63,7 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
         .clone();
 
     let target_addr = resolve_ipv4_target(target)?;
-    let (reply_tx, reply_rx) = mpsc::channel::<EcResult<(u64, mpsc::Receiver<Vec<u8>>)>>();
+    let (reply_tx, reply_rx) = mpsc::channel::<EcResult<OpenedTcpConnection>>();
     control
         .send(ControlMessage::Open {
             target: target_addr,
@@ -72,10 +72,11 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
         .map_err(|e| EcError::Runtime(format!("send open connection request failed: {e}")))?;
 
     match reply_rx.recv_timeout(OPEN_CONN_TIMEOUT) {
-        Ok(Ok((id, rx))) => Ok(TunnelTcpConnection {
-            id,
+        Ok(Ok(opened)) => Ok(TunnelTcpConnection {
+            id: opened.id,
             control_tx: control,
-            rx,
+            rx: opened.uplink_rx,
+            send_result_rx: opened.send_result_rx,
         }),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(EcError::Runtime(format!(
@@ -89,6 +90,7 @@ pub struct TunnelTcpConnection {
     id: u64,
     control_tx: mpsc::Sender<ControlMessage>,
     rx: mpsc::Receiver<Vec<u8>>,
+    send_result_rx: mpsc::Receiver<EcResult<()>>,
 }
 
 impl TunnelTcpConnection {
@@ -97,6 +99,7 @@ impl TunnelTcpConnection {
             TunnelTcpSender {
                 id: self.id,
                 control_tx: self.control_tx,
+                send_result_rx: self.send_result_rx,
             },
             self.rx,
         )
@@ -107,13 +110,17 @@ impl TunnelTcpConnection {
 pub struct TunnelTcpSender {
     id: u64,
     control_tx: mpsc::Sender<ControlMessage>,
+    send_result_rx: mpsc::Receiver<EcResult<()>>,
 }
 
 impl TunnelTcpSender {
     pub fn send(&self, data: Vec<u8>) -> EcResult<()> {
         self.control_tx
             .send(ControlMessage::Send { id: self.id, data })
-            .map_err(|e| EcError::Runtime(format!("send tcp payload request failed: {e}")))
+            .map_err(|e| EcError::Runtime(format!("send tcp payload request failed: {e}")))?;
+        self.send_result_rx
+            .recv()
+            .map_err(|e| EcError::Runtime(format!("wait tcp payload admission failed: {e}")))?
     }
 
     pub fn close(&self) -> EcResult<()> {
@@ -129,7 +136,7 @@ enum ControlMessage {
     },
     Open {
         target: SocketAddrV4,
-        reply: mpsc::Sender<EcResult<(u64, mpsc::Receiver<Vec<u8>>)>>,
+        reply: mpsc::Sender<EcResult<OpenedTcpConnection>>,
     },
     Send {
         id: u64,
@@ -140,11 +147,41 @@ enum ControlMessage {
     },
 }
 
+struct OpenedTcpConnection {
+    id: u64,
+    uplink_rx: mpsc::Receiver<Vec<u8>>,
+    send_result_rx: mpsc::Receiver<EcResult<()>>,
+}
+
 struct ConnectionState {
     handle: SocketHandle,
     uplink: mpsc::Sender<Vec<u8>>,
-    pending_send: VecDeque<Vec<u8>>,
+    send_result: mpsc::Sender<EcResult<()>>,
+    pending_send: Option<PendingSend>,
     close_requested: bool,
+}
+
+struct PendingSend {
+    data: Vec<u8>,
+    offset: usize,
+}
+
+impl PendingSend {
+    fn new(data: Vec<u8>) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.data[self.offset..]
+    }
+
+    fn advance(&mut self, sent: usize) {
+        self.offset += sent;
+    }
+
+    fn is_complete(&self) -> bool {
+        self.offset == self.data.len()
+    }
 }
 
 struct ControlDispatch<'a, 'b> {
@@ -240,7 +277,14 @@ fn handle_control_message(msg: ControlMessage, dispatch: &mut ControlDispatch<'_
         }
         ControlMessage::Send { id, data } => {
             if let Some(conn) = dispatch.connections.get_mut(&id) {
-                conn.pending_send.push_back(data);
+                if conn.pending_send.is_none() {
+                    conn.pending_send = Some(PendingSend::new(data));
+                } else {
+                    fail_pending_send(
+                        conn,
+                        EcError::Runtime("multiple tcp payloads pending admission".to_string()),
+                    );
+                }
             }
         }
         ControlMessage::Close { id } => {
@@ -279,7 +323,7 @@ fn open_connection(
     connections: &mut HashMap<u64, ConnectionState>,
     next_conn_id: &mut u64,
     next_local_port: &mut u16,
-) -> EcResult<(u64, mpsc::Receiver<Vec<u8>>)> {
+) -> EcResult<OpenedTcpConnection> {
     let socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
         tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
@@ -298,6 +342,7 @@ fn open_connection(
     match connect_result {
         Ok(()) => {
             let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>();
+            let (send_result_tx, send_result_rx) = mpsc::channel::<EcResult<()>>();
             let id = *next_conn_id;
             *next_conn_id = (*next_conn_id).wrapping_add(1);
             connections.insert(
@@ -305,11 +350,16 @@ fn open_connection(
                 ConnectionState {
                     handle,
                     uplink: uplink_tx,
-                    pending_send: VecDeque::new(),
+                    send_result: send_result_tx,
+                    pending_send: None,
                     close_requested: false,
                 },
             );
-            Ok((id, uplink_rx))
+            Ok(OpenedTcpConnection {
+                id,
+                uplink_rx,
+                send_result_rx,
+            })
         }
         Err(e) => {
             let _ = sockets.remove(handle);
@@ -326,10 +376,18 @@ fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64,
         pump_pending_sends(socket, conn);
         pump_uplink_reads(socket, conn);
 
-        if conn.close_requested && socket.may_send() {
+        if conn.close_requested && conn.pending_send.is_none() && socket.may_send() {
             socket.close();
         }
         if !socket.is_open() {
+            if conn.pending_send.is_some() {
+                fail_pending_send(
+                    conn,
+                    EcError::Runtime(
+                        "tcp connection closed before payload admission completed".to_string(),
+                    ),
+                );
+            }
             remove_ids.push(*id);
         }
     }
@@ -343,22 +401,47 @@ fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64,
 
 fn pump_pending_sends(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
     while socket.can_send() {
-        let Some(mut chunk) = conn.pending_send.pop_front() else {
+        let Some(pending) = conn.pending_send.as_mut() else {
             break;
         };
-        match socket.send_slice(&chunk) {
-            Ok(sent) if sent == chunk.len() => {}
+
+        if pending.is_complete() {
+            complete_pending_send(conn);
+            break;
+        }
+
+        match socket.send_slice(pending.remaining()) {
+            Ok(0) => break,
             Ok(sent) => {
-                chunk.drain(..sent);
-                conn.pending_send.push_front(chunk);
-                break;
+                pending.advance(sent);
+                if pending.is_complete() {
+                    complete_pending_send(conn);
+                } else {
+                    break;
+                }
             }
-            Err(_) => {
-                conn.close_requested = true;
+            Err(err) => {
+                fail_pending_send(
+                    conn,
+                    EcError::Runtime(format!("tcp payload admission failed: {err}")),
+                );
                 break;
             }
         }
     }
+}
+
+fn complete_pending_send(conn: &mut ConnectionState) {
+    conn.pending_send = None;
+    if conn.send_result.send(Ok(())).is_err() {
+        conn.close_requested = true;
+    }
+}
+
+fn fail_pending_send(conn: &mut ConnectionState, err: EcError) {
+    conn.pending_send = None;
+    let _ = conn.send_result.send(Err(err));
+    conn.close_requested = true;
 }
 
 fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
