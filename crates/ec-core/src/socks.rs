@@ -390,8 +390,7 @@ fn relay_direct_with_reply(
 }
 
 fn relay_tunnel(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> EcResult<()> {
-    let sender = conn.sender();
-    let rx = conn.into_receiver();
+    let (sender, rx) = conn.into_parts();
     let c_to_r_src = client
         .try_clone()
         .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;

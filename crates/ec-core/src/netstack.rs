@@ -92,19 +92,18 @@ pub struct TunnelTcpConnection {
 }
 
 impl TunnelTcpConnection {
-    pub fn sender(&self) -> TunnelTcpSender {
-        TunnelTcpSender {
-            id: self.id,
-            control_tx: self.control_tx.clone(),
-        }
-    }
-
-    pub fn into_receiver(self) -> mpsc::Receiver<Vec<u8>> {
-        self.rx
+    pub fn into_parts(self) -> (TunnelTcpSender, mpsc::Receiver<Vec<u8>>) {
+        (
+            TunnelTcpSender {
+                id: self.id,
+                control_tx: self.control_tx,
+            },
+            self.rx,
+        )
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TunnelTcpSender {
     id: u64,
     control_tx: mpsc::Sender<ControlMessage>,
