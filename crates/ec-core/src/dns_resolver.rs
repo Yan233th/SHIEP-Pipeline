@@ -96,8 +96,8 @@ pub(crate) fn resolve_first_ipv4(
     for &server in dns_servers {
         tried += 1;
         match query_server(host, server) {
-            Ok(ip) => {
-                cache_put(key, ip);
+            Ok((ip, ttl)) => {
+                cache_put(key, ip, ttl);
                 return Ok(ResolveResult {
                     ip,
                     source: ResolveSource::Server(server),
@@ -142,7 +142,12 @@ pub(crate) fn resolve_lookup(
             Ok(message) => {
                 let aliases = extract_cname_aliases(&message);
                 let ips = extract_ipv4s(&message);
-                lookup_cache_put(key, aliases.clone(), ips.clone());
+                lookup_cache_put(
+                    key,
+                    aliases.clone(),
+                    ips.clone(),
+                    response_cache_ttl(&message),
+                );
                 return Ok(LookupResolveResult {
                     aliases,
                     ips,
@@ -167,9 +172,24 @@ pub(crate) fn resolve_lookup(
     )))
 }
 
-fn query_server(host: &str, server: SocketAddr) -> EcResult<Ipv4Addr> {
+fn query_server(host: &str, server: SocketAddr) -> EcResult<(Ipv4Addr, Duration)> {
     let message = query_server_message(host, server)?;
-    extract_first_ipv4(&message, server)
+    Ok((
+        extract_first_ipv4(&message, server)?,
+        response_cache_ttl(&message),
+    ))
+}
+
+fn response_cache_ttl(message: &Message) -> Duration {
+    // Both cached addresses and aliases depend on the entire answer chain.
+    message
+        .answers()
+        .iter()
+        .filter(|answer| matches!(answer.data(), RData::A(_) | RData::CNAME(_)))
+        .map(|answer| Duration::from_secs(u64::from(answer.ttl())))
+        .min()
+        .unwrap_or(Duration::ZERO)
+        .min(DNS_CACHE_TTL)
 }
 
 fn query_server_message(host: &str, server: SocketAddr) -> EcResult<Message> {
@@ -363,9 +383,13 @@ fn cache_get(key: &CacheKey) -> Option<Ipv4Addr> {
     }
 }
 
-fn cache_put(key: CacheKey, ip: Ipv4Addr) {
+fn cache_put(key: CacheKey, ip: Ipv4Addr, ttl: Duration) {
     let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
+        if ttl.is_zero() {
+            guard.remove(&key);
+            return;
+        }
         prepare_cache_insert(&mut guard, &key, DNS_CACHE_CAPACITY, |entry| {
             entry.expires_at
         });
@@ -373,7 +397,7 @@ fn cache_put(key: CacheKey, ip: Ipv4Addr) {
             key,
             CacheEntry {
                 ip,
-                expires_at: Instant::now() + DNS_CACHE_TTL,
+                expires_at: Instant::now() + ttl,
             },
         );
     }
@@ -396,9 +420,13 @@ fn lookup_cache_get(key: &str) -> Option<(Vec<String>, Vec<Ipv4Addr>)> {
     }
 }
 
-fn lookup_cache_put(key: String, aliases: Vec<String>, ips: Vec<Ipv4Addr>) {
+fn lookup_cache_put(key: String, aliases: Vec<String>, ips: Vec<Ipv4Addr>, ttl: Duration) {
     let cache = DNS_LOOKUP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
+        if ttl.is_zero() {
+            guard.remove(&key);
+            return;
+        }
         prepare_cache_insert(&mut guard, &key, DNS_CACHE_CAPACITY, |entry| {
             entry.expires_at
         });
@@ -407,7 +435,7 @@ fn lookup_cache_put(key: String, aliases: Vec<String>, ips: Vec<Ipv4Addr>) {
             LookupCacheEntry {
                 aliases,
                 ips,
-                expires_at: Instant::now() + DNS_CACHE_TTL,
+                expires_at: Instant::now() + ttl,
             },
         );
     }
@@ -444,13 +472,96 @@ fn prepare_cache_insert<K, V>(
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_cache_insert;
+    use super::*;
+    use hickory_proto::rr::{
+        Record,
+        rdata::{A, CNAME},
+    };
     use std::collections::HashMap;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[derive(Clone, Copy)]
     struct TestEntry {
         expires_at: Instant,
+    }
+
+    fn answer_message(alias_ttl: u32, address_ttl: u32) -> Message {
+        let mut message = Message::new();
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("alias.example.test.").unwrap(),
+            alias_ttl,
+            RData::CNAME(CNAME(Name::from_ascii("origin.example.test.").unwrap())),
+        ));
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("origin.example.test.").unwrap(),
+            address_ttl,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        message
+    }
+
+    #[test]
+    fn cached_answers_expire_with_the_shortest_address_or_alias_ttl() {
+        for (alias_ttl, address_ttl, expected) in [
+            (20, 60, 20),
+            (60, 20, 20),
+            (3600, 3600, 300),
+            (0, 60, 0),
+            (60, 0, 0),
+        ] {
+            assert_eq!(
+                response_cache_ttl(&answer_message(alias_ttl, address_ttl)),
+                Duration::from_secs(expected)
+            );
+        }
+        assert_eq!(response_cache_ttl(&Message::new()), Duration::ZERO);
+        let mut message = answer_message(60, 60);
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("origin.example.test.").unwrap(),
+            10,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 2))),
+        ));
+        assert_eq!(response_cache_ttl(&message), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn zero_ttl_answers_are_queried_again_in_both_caches() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            for index in 1..=4 {
+                let mut buf = [0; 4096];
+                let (n, peer) = socket.recv_from(&mut buf).unwrap();
+                let query = Message::from_vec(&buf[..n]).unwrap();
+                let mut response = Message::new();
+                response
+                    .set_id(query.id())
+                    .set_message_type(MessageType::Response)
+                    .add_queries(query.queries().iter().cloned())
+                    .add_answer(Record::from_rdata(
+                        query.queries()[0].name().clone(),
+                        0,
+                        RData::A(A(Ipv4Addr::new(192, 0, 2, index))),
+                    ));
+                socket.send_to(&response.to_vec().unwrap(), peer).unwrap();
+            }
+        });
+        let host = format!("ttl-zero-{}.example.test", server.port());
+        for expected in 1..=2 {
+            let result = resolve_first_ipv4(i32::MAX, &host, &[server]).unwrap();
+            assert_eq!(result.source, ResolveSource::Server(server));
+            assert_eq!(result.ip, Ipv4Addr::new(192, 0, 2, expected));
+        }
+        for expected in 3..=4 {
+            let result = resolve_lookup(&host, &[server]).unwrap();
+            assert_eq!(result.source, ResolveSource::Server(server));
+            assert_eq!(result.ips, [Ipv4Addr::new(192, 0, 2, expected)]);
+        }
+        worker.join().unwrap();
     }
 
     #[test]
