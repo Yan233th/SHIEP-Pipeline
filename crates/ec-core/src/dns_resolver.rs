@@ -193,14 +193,17 @@ fn response_cache_ttl(message: &Message) -> Duration {
 }
 
 fn query_server_message(host: &str, server: SocketAddr) -> EcResult<Message> {
-    let (id, request) = build_a_query(host)?;
-    match query_udp(id, &request, server)? {
+    let query = build_a_query(host)?;
+    let request = query
+        .to_vec()
+        .map_err(|e| EcError::Runtime(format!("dns query encode failed: {e}")))?;
+    match query_udp(&query, &request, server)? {
         UdpQueryResult::Complete(message) => Ok(message),
-        UdpQueryResult::Truncated => query_tcp(id, &request, server),
+        UdpQueryResult::Truncated => query_tcp(&query, &request, server),
     }
 }
 
-fn build_a_query(host: &str) -> EcResult<(u16, Vec<u8>)> {
+fn build_a_query(host: &str) -> EcResult<Message> {
     let mut message = Message::new();
     let id = next_query_id();
     let fqdn = if host.ends_with('.') {
@@ -216,40 +219,32 @@ fn build_a_query(host: &str) -> EcResult<(u16, Vec<u8>)> {
         .set_recursion_desired(true)
         .add_query(Query::query(name, RecordType::A));
 
-    let payload = message
-        .to_vec()
-        .map_err(|e| EcError::Runtime(format!("dns query encode failed: {e}")))?;
-    Ok((id, payload))
+    Ok(message)
 }
 
-fn query_udp(id: u16, request: &[u8], server: SocketAddr) -> EcResult<UdpQueryResult> {
+fn query_udp(query: &Message, request: &[u8], server: SocketAddr) -> EcResult<UdpQueryResult> {
     let socket = bind_udp_socket(server)?;
+    // Connected UDP lets the OS reject datagrams from other peers.
     socket
-        .send_to(request, server)
+        .connect(server)
+        .map_err(|e| EcError::Runtime(format!("dns udp connect failed: {e}")))?;
+    socket
+        .send(request)
         .map_err(|e| EcError::Runtime(format!("dns udp send failed: {e}")))?;
 
     let mut buf = [0u8; DNS_UDP_BUFFER_SIZE];
-    // Ignore packets from unexpected peers and only accept responses from the queried server.
-    let deadline = Instant::now() + DNS_IO_TIMEOUT;
-    while Instant::now() < deadline {
-        let (n, peer) = socket
-            .recv_from(&mut buf)
-            .map_err(|e| EcError::Runtime(format!("dns udp recv failed: {e}")))?;
-        if peer != server {
-            continue;
-        }
-        let message = decode_dns_response(&buf[..n], id, server)?;
-        if message.truncated() {
-            return Ok(UdpQueryResult::Truncated);
-        }
-        return Ok(UdpQueryResult::Complete(message));
+    let n = socket
+        .recv(&mut buf)
+        .map_err(|e| EcError::Runtime(format!("dns udp recv failed: {e}")))?;
+    let message = decode_dns_response(&buf[..n], query, server)?;
+    if message.truncated() {
+        Ok(UdpQueryResult::Truncated)
+    } else {
+        Ok(UdpQueryResult::Complete(message))
     }
-    Err(EcError::Runtime(format!(
-        "dns udp recv failed: no valid response from {server}"
-    )))
 }
 
-fn query_tcp(id: u16, request: &[u8], server: SocketAddr) -> EcResult<Message> {
+fn query_tcp(query: &Message, request: &[u8], server: SocketAddr) -> EcResult<Message> {
     let mut stream = TcpStream::connect_timeout(&server, DNS_IO_TIMEOUT)
         .map_err(|e| EcError::Runtime(format!("dns tcp connect failed: {e}")))?;
     stream
@@ -281,21 +276,33 @@ fn query_tcp(id: u16, request: &[u8], server: SocketAddr) -> EcResult<Message> {
     stream
         .read_exact(&mut payload)
         .map_err(|e| EcError::Runtime(format!("dns tcp payload read failed: {e}")))?;
-    decode_dns_response(&payload, id, server)
+    let message = decode_dns_response(&payload, query, server)?;
+    if message.truncated() {
+        return Err(EcError::Runtime(format!(
+            "dns tcp response is truncated from {server}"
+        )));
+    }
+    Ok(message)
 }
 
-fn decode_dns_response(payload: &[u8], expected_id: u16, server: SocketAddr) -> EcResult<Message> {
+fn decode_dns_response(payload: &[u8], query: &Message, server: SocketAddr) -> EcResult<Message> {
     let message = Message::from_vec(payload)
         .map_err(|e| EcError::Runtime(format!("dns response decode failed: {e}")))?;
-    if message.id() != expected_id {
+    if message.id() != query.id() {
         return Err(EcError::Runtime(format!(
-            "dns response id mismatch from {server}: expected {expected_id}, got {}",
+            "dns response id mismatch from {server}: expected {}, got {}",
+            query.id(),
             message.id()
         )));
     }
     if message.message_type() != MessageType::Response {
         return Err(EcError::Runtime(format!(
             "dns response message type is not response from {server}"
+        )));
+    }
+    if message.op_code() != query.op_code() || message.queries() != query.queries() {
+        return Err(EcError::Runtime(format!(
+            "dns response question mismatch from {server}"
         )));
     }
     if message.response_code() != ResponseCode::NoError {
@@ -473,11 +480,13 @@ fn prepare_cache_insert<K, V>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::OpCode;
     use hickory_proto::rr::{
-        Record,
+        DNSClass, Record,
         rdata::{A, CNAME},
     };
     use std::collections::HashMap;
+    use std::net::TcpListener;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -562,6 +571,178 @@ mod tests {
             assert_eq!(result.ips, [Ipv4Addr::new(192, 0, 2, expected)]);
         }
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn lookup_rejects_a_reply_for_a_different_question() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let mut buf = [0; 4096];
+            let (n, peer) = socket.recv_from(&mut buf).unwrap();
+            let request = Message::from_vec(&buf[..n]).unwrap();
+            let other = Name::from_ascii("other.example.test.").unwrap();
+            let mut response = Message::new();
+            response
+                .set_id(request.id())
+                .set_message_type(MessageType::Response)
+                .add_query(Query::query(other.clone(), RecordType::A))
+                .add_answer(Record::from_rdata(
+                    other,
+                    60,
+                    RData::A(A(Ipv4Addr::new(192, 0, 2, 99))),
+                ));
+            socket.send_to(&response.to_vec().unwrap(), peer).unwrap();
+        });
+        let result = query_server_message("expected.example.test", server);
+        worker.join().unwrap();
+        assert!(
+            result.is_err(),
+            "accepted an answer to an unrelated DNS question"
+        );
+    }
+
+    #[test]
+    fn response_validation_matches_the_complete_question() {
+        let query = build_a_query("Example.TEST").unwrap();
+        let server = "192.0.2.53:53".parse().unwrap();
+        let mut response = query.clone();
+        response.set_message_type(MessageType::Response);
+        response.queries_mut()[0].set_name(Name::from_ascii("example.test.").unwrap());
+        assert!(decode_dns_response(&response.to_vec().unwrap(), &query, server).is_ok());
+        for case in 0..9 {
+            let mut invalid = response.clone();
+            match case {
+                0 => {
+                    invalid.set_id(query.id().wrapping_add(1));
+                }
+                1 => {
+                    invalid.set_message_type(MessageType::Query);
+                }
+                2 => {
+                    invalid.set_op_code(OpCode::Update);
+                }
+                3 => {
+                    invalid.queries_mut()[0].set_name(Name::from_ascii("other.test.").unwrap());
+                }
+                4 => {
+                    invalid.queries_mut()[0].set_query_type(RecordType::AAAA);
+                }
+                5 => {
+                    invalid.queries_mut()[0].set_query_class(DNSClass::CH);
+                }
+                6 => {
+                    invalid.queries_mut().clear();
+                }
+                7 => {
+                    invalid.add_query(query.queries()[0].clone());
+                }
+                8 => {
+                    invalid.set_response_code(ResponseCode::NXDomain);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                decode_dns_response(&invalid.to_vec().unwrap(), &query, server).is_err(),
+                "accepted mismatch {case}"
+            );
+        }
+        assert!(decode_dns_response(&[0; 3], &query, server).is_err());
+    }
+
+    fn response_for(query: &Message, ip: Ipv4Addr) -> Message {
+        let mut response = Message::new();
+        response
+            .set_id(query.id())
+            .set_message_type(MessageType::Response)
+            .add_queries(query.queries().iter().cloned())
+            .add_answer(Record::from_rdata(
+                query.queries()[0].name().clone(),
+                60,
+                RData::A(A(ip)),
+            ));
+        response
+    }
+
+    #[test]
+    fn udp_ignores_valid_replies_from_another_peer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let mut buf = [0; 4096];
+            let (n, peer) = socket.recv_from(&mut buf).unwrap();
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+            other
+                .send_to(
+                    &response_for(&query, Ipv4Addr::new(192, 0, 2, 99))
+                        .to_vec()
+                        .unwrap(),
+                    peer,
+                )
+                .unwrap();
+            socket
+                .send_to(
+                    &response_for(&query, Ipv4Addr::new(192, 0, 2, 7))
+                        .to_vec()
+                        .unwrap(),
+                    peer,
+                )
+                .unwrap();
+        });
+        let (ip, _) = query_server("peer.example.test", server).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 0, 2, 7));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn truncated_udp_retries_over_tcp_and_requires_a_complete_response() {
+        for truncated_tcp in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let server = listener.local_addr().unwrap();
+            let udp = UdpSocket::bind(server).unwrap();
+            udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let worker = thread::spawn(move || {
+                let mut buf = [0; 4096];
+                let (n, peer) = udp.recv_from(&mut buf).unwrap();
+                let query = Message::from_vec(&buf[..n]).unwrap();
+                let mut truncated = query.clone();
+                truncated
+                    .set_message_type(MessageType::Response)
+                    .set_truncated(true);
+                udp.send_to(&truncated.to_vec().unwrap(), peer).unwrap();
+                let (mut tcp, _) = listener.accept().unwrap();
+                tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                tcp.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut length = [0; 2];
+                tcp.read_exact(&mut length).unwrap();
+                let mut request = vec![0; usize::from(u16::from_be_bytes(length))];
+                tcp.read_exact(&mut request).unwrap();
+                assert_eq!(request, query.to_vec().unwrap());
+                let mut response = response_for(&query, Ipv4Addr::new(192, 0, 2, 8));
+                response.set_truncated(truncated_tcp);
+                let response = response.to_vec().unwrap();
+                tcp.write_all(&(response.len() as u16).to_be_bytes())
+                    .unwrap();
+                tcp.write_all(&response).unwrap();
+            });
+            let result = query_server("truncated.example.test", server);
+            if truncated_tcp {
+                assert!(
+                    crate::error::concise_error(result.unwrap_err())
+                        .contains("tcp response is truncated")
+                );
+            } else {
+                assert_eq!(result.unwrap().0, Ipv4Addr::new(192, 0, 2, 8));
+            }
+            worker.join().unwrap();
+        }
     }
 
     #[test]
