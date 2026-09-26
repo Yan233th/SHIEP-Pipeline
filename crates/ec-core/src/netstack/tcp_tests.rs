@@ -714,6 +714,95 @@ fn connect_deadline_does_not_apply_after_establishment() {
 }
 
 #[test]
+fn tunnel_upload_relay_forwards_short_writes_and_resumes_after_backpressure() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let (conn, control_rx) = rig.tunnel_connection();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (relay_client, _) = listener.accept().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let relay = thread::spawn(move || {
+        let _ = done_tx.send(crate::socks::relay_tunnel(relay_client, conn));
+    });
+
+    // A short write must reach the peer without waiting for more data or EOF.
+    client.write_all(b"head").unwrap();
+    let mut head = [0; 4];
+    let mut head_len = 0;
+    while head_len < head.len() {
+        rig.control(control_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        head_len += rig
+            .sockets
+            .get_mut::<tcp::Socket>(rig.server)
+            .recv_slice(&mut head[head_len..])
+            .unwrap();
+    }
+    assert_eq!(&head, b"head");
+
+    let payload: Vec<u8> = (0..4 * SOCKET_BUFFER_CAPACITY)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let expected = payload.clone();
+    let writer = thread::spawn(move || {
+        client.write_all(&payload).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+    });
+
+    // Leave the peer unread until both TCP buffers fill and admission blocks.
+    for _ in 0..256 {
+        rig.control(control_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        if rig.connections[&1].pending_send.is_some() {
+            break;
+        }
+    }
+    assert!(rig.connections[&1].pending_send.is_some());
+    assert_eq!(rig.client().send_queue(), SOCKET_BUFFER_CAPACITY);
+    assert_eq!(
+        rig.sockets.get::<tcp::Socket>(rig.server).recv_queue(),
+        SOCKET_BUFFER_CAPACITY
+    );
+    rig.steps(10);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+    let mut received = Vec::new();
+    for _ in 0..512 {
+        let peer = rig.sockets.get_mut::<tcp::Socket>(rig.server);
+        while peer.can_recv() {
+            let mut buf = [0; 4096];
+            let n = peer.recv_slice(&mut buf).unwrap();
+            received.extend_from_slice(&buf[..n]);
+        }
+        if peer.state() == tcp::State::CloseWait {
+            break;
+        }
+        rig.steps(4);
+        let conn = &rig.connections[&1];
+        if conn.pending_send.is_none() && !conn.close_requested {
+            rig.control(control_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+    }
+    assert_eq!(received, expected);
+    let peer = rig.sockets.get_mut::<tcp::Socket>(rig.server);
+    assert_eq!(peer.state(), tcp::State::CloseWait);
+    peer.close();
+    rig.steps(10);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok()
+    );
+    assert!(rig.connections.is_empty());
+    writer.join().unwrap();
+    relay.join().unwrap();
+}
+
+#[test]
 fn partial_upload_preserves_bytes_and_fin_order() {
     let mut rig = Rig::new();
     rig.establish();

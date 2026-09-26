@@ -10,6 +10,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
+const TUNNEL_UPLOAD_BUFFER_SIZE: usize = 8 * 1024;
 
 pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
@@ -437,7 +438,7 @@ fn relay_client_to_tunnel(
     mut client: TcpStream,
     sender: crate::netstack::TunnelTcpSender,
 ) -> EcResult<()> {
-    let mut buf = [0u8; RELAY_BUFFER_SIZE];
+    let mut buf = [0u8; TUNNEL_UPLOAD_BUFFER_SIZE];
     loop {
         match client.read(&mut buf) {
             Ok(0) => return sender.close(),
