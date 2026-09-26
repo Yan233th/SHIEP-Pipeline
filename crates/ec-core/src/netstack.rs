@@ -472,12 +472,18 @@ fn connection_wait(
 ) -> Option<Duration> {
     connections
         .values()
-        .filter_map(|conn| conn.opening.as_ref())
-        .map(|pending| {
+        .filter_map(|conn| {
+            // A peer reset may leave no TCP timer. Still finish an outstanding abort.
+            if conn.aborted {
+                return Some(Duration::ZERO);
+            }
+            let pending = conn.opening.as_ref()?;
             if now >= pending.deadline {
-                Duration::ZERO
+                Some(Duration::ZERO)
             } else {
-                Duration::from_millis((pending.deadline - now).total_millis())
+                Some(Duration::from_millis(
+                    (pending.deadline - now).total_millis(),
+                ))
             }
         })
         .chain(tcp_wait)

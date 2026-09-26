@@ -330,10 +330,15 @@ fn connect_deadline_wakes_the_loop_and_releases_the_socket() {
         crate::error::concise_error(err),
         "tcp connect timed out after 10s"
     );
+    assert_eq!(
+        connection_wait(None, &rig.connections, deadline),
+        Some(Duration::ZERO)
+    );
     rig.clock = deadline.total_millis();
     rig.steps(1);
     assert!(rig.connections.is_empty());
     assert_eq!(rig.sockets.iter().count(), 1);
+    assert_eq!(connection_wait(None, &rig.connections, deadline), None);
 }
 
 #[test]
@@ -360,6 +365,37 @@ fn refused_connect_never_reports_success() {
     };
     assert!(crate::error::concise_error(err).contains("refused or reset"));
     assert!(rig.connections.is_empty());
+}
+
+#[test]
+fn teardown_is_scheduled_even_after_the_peer_has_reset_its_tuple() {
+    let mut rig = Rig::new();
+    rig.sockets.get_mut::<tcp::Socket>(rig.server).close();
+    // Deliver the refusal before driving the application-level open result.
+    for clock in 1..=4 {
+        rig.iface.poll(
+            SmolInstant::from_millis(clock),
+            &mut rig.device,
+            &mut rig.sockets,
+        );
+    }
+    assert_eq!(rig.client().state(), tcp::State::Closed);
+    drive_connections(
+        &mut rig.sockets,
+        &mut rig.connections,
+        SmolInstant::from_millis(4),
+    );
+    assert!(rig.reply.try_recv().unwrap().is_err());
+    assert_eq!(
+        connection_wait(None, &rig.connections, SmolInstant::from_millis(4)),
+        Some(Duration::ZERO)
+    );
+    rig.steps(1);
+    assert!(rig.connections.is_empty());
+    assert_eq!(
+        connection_wait(None, &rig.connections, SmolInstant::from_millis(rig.clock)),
+        None
+    );
 }
 
 #[test]
