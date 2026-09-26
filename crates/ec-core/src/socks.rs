@@ -396,9 +396,9 @@ fn relay_tunnel(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnectio
         .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;
 
     let uplink = thread::spawn(move || relay_client_to_tunnel(c_to_r_src, sender));
-    let downlink = thread::spawn(move || relay_tunnel_to_client(&mut client, rx));
+    let downlink = relay_tunnel_to_client(&mut client, rx);
 
-    join_relay_workers(uplink, downlink)
+    join_relay_worker(uplink, "uplink").and(downlink)
 }
 
 fn relay_direct(client: TcpStream, upstream: TcpStream) -> EcResult<()> {
@@ -410,10 +410,9 @@ fn relay_direct(client: TcpStream, upstream: TcpStream) -> EcResult<()> {
         .map_err(|e| EcError::Runtime(format!("clone upstream stream failed: {e}")))?;
 
     let uplink = thread::spawn(move || pump_stream(client_reader, upstream, "client to upstream"));
-    let downlink =
-        thread::spawn(move || pump_stream(upstream_reader, client, "upstream to client"));
+    let downlink = pump_stream(upstream_reader, client, "upstream to client");
 
-    join_relay_workers(uplink, downlink)
+    join_relay_worker(uplink, "uplink").and(downlink)
 }
 
 fn relay_client_to_tunnel(
@@ -421,22 +420,21 @@ fn relay_client_to_tunnel(
     sender: crate::netstack::TunnelTcpSender,
 ) -> EcResult<()> {
     let mut buf = [0u8; RELAY_BUFFER_SIZE];
-    let result = loop {
+    loop {
         match client.read(&mut buf) {
-            Ok(0) => break Ok(()),
+            Ok(0) => return sender.close(),
             Ok(n) => {
-                sender.send(buf[..n].to_vec())?;
+                if let Err(err) = sender.send(buf[..n].to_vec()) {
+                    let _ = client.shutdown(Shutdown::Both);
+                    return Err(err);
+                }
             }
-            Err(err) if is_expected_relay_io_error(&err) => break Ok(()),
             Err(err) => {
-                break Err(EcError::Runtime(format!(
-                    "client to tunnel read failed: {err}"
-                )));
+                let _ = client.shutdown(Shutdown::Both);
+                return relay_io_result(err, "client to tunnel read");
             }
         }
-    };
-    let close_result = sender.close();
-    result.and(close_result)
+    }
 }
 
 fn relay_tunnel_to_client(
@@ -448,12 +446,8 @@ fn relay_tunnel_to_client(
             continue;
         }
         if let Err(err) = client.write_all(&chunk) {
-            if is_expected_relay_io_error(&err) {
-                return Ok(());
-            }
-            return Err(EcError::Runtime(format!(
-                "tunnel to client write failed: {err}"
-            )));
+            let _ = client.shutdown(Shutdown::Both);
+            return relay_io_result(err, "tunnel to client write");
         }
     }
     shutdown_write(client, "client")
@@ -466,20 +460,28 @@ fn pump_stream(mut src: TcpStream, mut dst: TcpStream, direction: &'static str) 
             Ok(0) => break Ok(()),
             Ok(n) => {
                 if let Err(err) = dst.write_all(&buf[..n]) {
-                    if is_expected_relay_io_error(&err) {
-                        break Ok(());
-                    }
-                    break Err(EcError::Runtime(format!("{direction} write failed: {err}")));
+                    let _ = src.shutdown(Shutdown::Both);
+                    let _ = dst.shutdown(Shutdown::Both);
+                    break relay_io_result(err, &format!("{direction} write"));
                 }
             }
-            Err(err) if is_expected_relay_io_error(&err) => break Ok(()),
             Err(err) => {
-                break Err(EcError::Runtime(format!("{direction} read failed: {err}")));
+                let _ = src.shutdown(Shutdown::Both);
+                let _ = dst.shutdown(Shutdown::Both);
+                break relay_io_result(err, &format!("{direction} read"));
             }
         }
     };
     let shutdown_result = shutdown_write(&dst, direction);
     result.and(shutdown_result)
+}
+
+fn relay_io_result(err: std::io::Error, context: &str) -> EcResult<()> {
+    if is_expected_relay_io_error(&err) {
+        Ok(())
+    } else {
+        Err(EcError::Runtime(format!("{context} failed: {err}")))
+    }
 }
 
 fn shutdown_write(stream: &TcpStream, peer: &str) -> EcResult<()> {
@@ -490,15 +492,6 @@ fn shutdown_write(stream: &TcpStream, peer: &str) -> EcResult<()> {
             "{peer} write shutdown failed: {err}"
         ))),
     }
-}
-
-fn join_relay_workers(
-    uplink: thread::JoinHandle<EcResult<()>>,
-    downlink: thread::JoinHandle<EcResult<()>>,
-) -> EcResult<()> {
-    let uplink_result = join_relay_worker(uplink, "uplink");
-    let downlink_result = join_relay_worker(downlink, "downlink");
-    uplink_result.and(downlink_result)
 }
 
 fn join_relay_worker(
@@ -564,7 +557,8 @@ mod tests {
     use super::{
         ClientFailure, SOCKS_REP_SUCCEEDED, describe_route_source, handle_client,
         is_expected_relay_io_error, is_retryable_accept_error, join_relay_worker,
-        normalize_bind_addr, route_decision_planner_error, route_decision_remote, target_addr,
+        normalize_bind_addr, relay_direct, route_decision_planner_error, route_decision_remote,
+        target_addr,
     };
     use crate::error::EcError;
     use crate::route_table::RouteTable;
@@ -825,6 +819,71 @@ mod tests {
             crate::error::concise_error(err),
             "uplink relay worker panicked"
         );
+    }
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (relay, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        (peer, relay)
+    }
+
+    #[test]
+    fn relay_preserves_half_close_in_both_directions() {
+        for server_closes_first in [false, true] {
+            let (client, relay_client) = tcp_pair();
+            let (server, relay_upstream) = tcp_pair();
+            let relay = thread::spawn(move || relay_direct(relay_client, relay_upstream));
+            let (mut first, mut second) = if server_closes_first {
+                (server, client)
+            } else {
+                (client, server)
+            };
+            first.write_all(b"before FIN").unwrap();
+            first.shutdown(Shutdown::Write).unwrap();
+            let mut data = Vec::new();
+            second.read_to_end(&mut data).unwrap();
+            assert_eq!(data, b"before FIN");
+            second.write_all(b"after FIN").unwrap();
+            second.shutdown(Shutdown::Write).unwrap();
+            data.clear();
+            first.read_to_end(&mut data).unwrap();
+            assert_eq!(data, b"after FIN");
+            assert!(relay.join().unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn relay_reset_wakes_the_opposite_direction() {
+        for reset_client in [false, true] {
+            let (client, relay_client) = tcp_pair();
+            let (server, relay_upstream) = tcp_pair();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let relay = thread::spawn(move || {
+                let _ = done_tx.send(relay_direct(relay_client, relay_upstream));
+            });
+            let (reset_peer, mut remaining_peer) = if reset_client {
+                (client, server)
+            } else {
+                (server, client)
+            };
+            socket2::SockRef::from(&reset_peer)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(reset_peer);
+            let mut data = Vec::new();
+            remaining_peer.read_to_end(&mut data).unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .is_ok()
+            );
+            relay.join().unwrap();
+        }
     }
 
     #[test]
