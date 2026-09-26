@@ -2,8 +2,8 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, RouteKind, Scope};
 use crate::socks_proxy::{FallbackProxy, connect_via_proxy, parse_fallback_proxy};
 use crate::socks_wire::{
-    ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_SUCCEEDED, SocksCommand,
-    format_socket_target, negotiate_method, read_socks_request, write_reply,
+    ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_GENERAL_FAILURE, SOCKS_REP_SUCCEEDED,
+    SocksCommand, format_socket_target, negotiate_method, read_socks_request, write_reply,
 };
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
@@ -326,7 +326,11 @@ fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDeci
     }
 }
 
-fn execute_route(client: TcpStream, target_display: &str, route: RouteDecision) -> EcResult<()> {
+fn execute_route(
+    mut client: TcpStream,
+    target_display: &str,
+    route: RouteDecision,
+) -> EcResult<()> {
     let RouteDecision {
         line: _,
         path,
@@ -337,28 +341,39 @@ fn execute_route(client: TcpStream, target_display: &str, route: RouteDecision) 
     match transport {
         RouteTransport::Tunnel(dial_target) => {
             let conn = crate::netstack::open_tcp_connection(&dial_target)
-                .map_err(|e| route_runtime_error(target_display, route_path, e))?;
-            let mut client = client;
+                .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
             write_connect_ok_reply(&mut client, target_display, route_path)?;
             relay_tunnel(client, conn)
                 .map_err(|e| route_runtime_error(target_display, route_path, e))
         }
         RouteTransport::Direct(dial_target) => {
             let conn = TcpStream::connect(&dial_target)
-                .map_err(|e| route_runtime_error(target_display, route_path, e))?;
+                .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
             relay_direct_with_reply(client, conn, target_display, route_path)
         }
         RouteTransport::Proxy(proxy, target) => {
             let conn = connect_via_proxy(&proxy, target.host(), target.port())
-                .map_err(|e| route_runtime_error(target_display, route_path, e))?;
+                .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
             relay_direct_with_reply(client, conn, target_display, route_path)
         }
-        RouteTransport::Unsupported(reason) => Err(route_runtime_error(
+        RouteTransport::Unsupported(reason) => Err(reply_connect_error(
+            &mut client,
             target_display,
             route_path,
             reason.as_str(),
         )),
     }
+}
+
+fn reply_connect_error(
+    client: &mut TcpStream,
+    target_display: &str,
+    route_path: &str,
+    err: impl std::fmt::Display,
+) -> EcError {
+    // Preserve the upstream cause even if the client has already disconnected.
+    let _ = write_reply(client, SOCKS_REP_GENERAL_FAILURE);
+    route_runtime_error(target_display, route_path, err)
 }
 
 fn route_runtime_error(
@@ -566,7 +581,8 @@ fn is_ip_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFailure, SOCKS_REP_SUCCEEDED, describe_route_source, handle_client,
+        ClientFailure, RouteDecision, RouteTransport, SOCKS_REP_GENERAL_FAILURE,
+        SOCKS_REP_SUCCEEDED, describe_route_source, execute_route, handle_client,
         is_expected_relay_io_error, is_retryable_accept_error, join_relay_worker,
         normalize_bind_addr, relay_direct, route_decision_planner_error, route_decision_remote,
         target_addr,
@@ -724,6 +740,18 @@ mod tests {
         target_host: &str,
         target_port: u16,
     ) -> TcpStream {
+        let mut client = request_test_socks_client(socks_addr, target_host, target_port);
+        let mut connect_reply = [0u8; 10];
+        client.read_exact(&mut connect_reply).unwrap();
+        assert_eq!(connect_reply[1], SOCKS_REP_SUCCEEDED);
+        client
+    }
+
+    fn request_test_socks_client(
+        socks_addr: SocketAddr,
+        target_host: &str,
+        target_port: u16,
+    ) -> TcpStream {
         let mut client = TcpStream::connect(socks_addr).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -741,10 +769,139 @@ mod tests {
         request.extend_from_slice(host);
         request.extend_from_slice(&target_port.to_be_bytes());
         client.write_all(&request).unwrap();
-        let mut connect_reply = [0u8; 10];
-        client.read_exact(&mut connect_reply).unwrap();
-        assert_eq!(connect_reply[1], SOCKS_REP_SUCCEEDED);
         client
+    }
+
+    fn assert_connect_failure_reply(mut client: TcpStream) {
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(
+            response,
+            [0x05, SOCKS_REP_GENERAL_FAILURE, 0, 1, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn refused_direct_connection_sends_failure_reply_before_closing() {
+        install_empty_test_router();
+        let refused =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        refused.bind(&addr.into()).unwrap();
+        let target = refused.local_addr().unwrap().as_socket().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_client(stream, None)
+        });
+        assert_connect_failure_reply(request_test_socks_client(addr, "127.0.0.1", target.port()));
+        let Err(ClientFailure::Upstream(error)) = server.join().unwrap() else {
+            panic!("expected upstream failure");
+        };
+        assert!(error.to_string().contains(&format!("dial: {target}")));
+    }
+
+    #[test]
+    fn rejected_proxy_connection_sends_failure_reply_and_keeps_upstream_cause() {
+        install_empty_test_router();
+        for kind in [TestProxyKind::Socks5, TestProxyKind::Http] {
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!(
+                "{}://{}",
+                kind.scheme(),
+                proxy_listener.local_addr().unwrap()
+            );
+            let proxy = parse_fallback_proxy(Some(&url)).unwrap().unwrap();
+            let proxy_worker = thread::spawn(move || {
+                let (mut stream, _) = proxy_listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                match kind {
+                    TestProxyKind::Socks5 => {
+                        crate::socks_wire::negotiate_method(&mut stream).unwrap();
+                        crate::socks_wire::read_socks_request(&mut stream).unwrap();
+                        crate::socks_wire::write_reply(&mut stream, 0x05).unwrap();
+                    }
+                    TestProxyKind::Http => {
+                        read_http_connect_head(&mut stream);
+                        stream
+                            .write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+                            .unwrap();
+                    }
+                }
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                handle_client(stream, Some(&proxy))
+            });
+            assert_connect_failure_reply(request_test_socks_client(
+                addr,
+                "upstream.example.test",
+                443,
+            ));
+            let Err(ClientFailure::Upstream(error)) = server.join().unwrap() else {
+                panic!("expected upstream failure");
+            };
+            let expected: &[&str] = match kind {
+                TestProxyKind::Socks5 => &["0x05", "(connection refused)"],
+                TestProxyKind::Http => &["503 Service Unavailable"],
+            };
+            let error = crate::error::concise_error(error);
+            assert!(
+                expected.iter().all(|part| error.contains(part)),
+                "{error:?}"
+            );
+            proxy_worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn unavailable_tunnel_or_route_sends_failure_reply() {
+        for transport in [
+            RouteTransport::Tunnel("[::1]:443".to_string()),
+            RouteTransport::Unsupported("no route transport available".to_string()),
+        ] {
+            let (client, relay) = tcp_pair();
+            let server = thread::spawn(move || {
+                execute_route(
+                    relay,
+                    "example.test:443",
+                    RouteDecision {
+                        line: String::new(),
+                        path: "unavailable".to_string(),
+                        transport,
+                    },
+                )
+            });
+            assert_connect_failure_reply(client);
+            assert!(server.join().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn failed_reply_write_preserves_the_original_error() {
+        let (client, mut relay) = tcp_pair();
+        relay.shutdown(Shutdown::Write).unwrap();
+        let error = super::reply_connect_error(
+            &mut relay,
+            "example.test:443",
+            "remote",
+            "original failure",
+        );
+        assert_eq!(
+            crate::error::concise_error(error),
+            "example.test:443 -> remote; error: original failure"
+        );
+        let mut response = Vec::new();
+        (&client).read_to_end(&mut response).unwrap();
+        assert!(response.is_empty());
     }
 
     fn assert_proxy_fallback_relays_bidirectionally(kind: TestProxyKind) {
