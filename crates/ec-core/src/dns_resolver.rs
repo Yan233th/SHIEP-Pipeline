@@ -1,7 +1,7 @@
 use crate::error::{EcError, EcResult};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -55,6 +55,13 @@ struct LookupCacheEntry {
     aliases: Vec<String>,
     ips: Vec<Ipv4Addr>,
     expires_at: Instant,
+}
+
+#[derive(Debug)]
+struct DnsAnswer {
+    aliases: Vec<String>,
+    ips: Vec<Ipv4Addr>,
+    ttl: Duration,
 }
 
 enum UdpQueryResult {
@@ -138,16 +145,9 @@ pub(crate) fn resolve_lookup(
     let mut last_error: Option<String> = None;
     for &server in dns_servers {
         tried += 1;
-        match query_server_message(host, server) {
-            Ok(message) => {
-                let aliases = extract_cname_aliases(&message);
-                let ips = extract_ipv4s(&message);
-                lookup_cache_put(
-                    key,
-                    aliases.clone(),
-                    ips.clone(),
-                    response_cache_ttl(&message),
-                );
+        match query_server_answer(host, server) {
+            Ok(DnsAnswer { aliases, ips, ttl }) => {
+                lookup_cache_put(key, aliases.clone(), ips.clone(), ttl);
                 return Ok(LookupResolveResult {
                     aliases,
                     ips,
@@ -173,23 +173,17 @@ pub(crate) fn resolve_lookup(
 }
 
 fn query_server(host: &str, server: SocketAddr) -> EcResult<(Ipv4Addr, Duration)> {
-    let message = query_server_message(host, server)?;
-    Ok((
-        extract_first_ipv4(&message, server)?,
-        response_cache_ttl(&message),
-    ))
+    let answer = query_server_answer(host, server)?;
+    let ip = answer
+        .ips
+        .first()
+        .copied()
+        .ok_or_else(|| EcError::Runtime(format!("dns no A answer from {server}")))?;
+    Ok((ip, answer.ttl))
 }
 
-fn response_cache_ttl(message: &Message) -> Duration {
-    // Both cached addresses and aliases depend on the entire answer chain.
-    message
-        .answers()
-        .iter()
-        .filter(|answer| matches!(answer.data(), RData::A(_) | RData::CNAME(_)))
-        .map(|answer| Duration::from_secs(u64::from(answer.ttl())))
-        .min()
-        .unwrap_or(Duration::ZERO)
-        .min(DNS_CACHE_TTL)
+fn query_server_answer(host: &str, server: SocketAddr) -> EcResult<DnsAnswer> {
+    extract_answer(&query_server_message(host, server)?)
 }
 
 fn query_server_message(host: &str, server: SocketAddr) -> EcResult<Message> {
@@ -314,39 +308,72 @@ fn decode_dns_response(payload: &[u8], query: &Message, server: SocketAddr) -> E
     Ok(message)
 }
 
-fn extract_first_ipv4(message: &Message, server: SocketAddr) -> EcResult<Ipv4Addr> {
-    if let Some(ip) = extract_ipv4s(message).into_iter().next() {
-        return Ok(ip);
-    }
-    Err(EcError::Runtime(format!("dns no A answer from {server}")))
-}
-
-fn extract_ipv4s(message: &Message) -> Vec<Ipv4Addr> {
-    let mut ips = Vec::<Ipv4Addr>::new();
-    for answer in message.answers() {
-        let Some(ip) = answer.data().as_a() else {
-            continue;
-        };
-        let ip = **ip;
-        if !ips.contains(&ip) {
-            ips.push(ip);
+fn extract_answer(message: &Message) -> EcResult<DnsAnswer> {
+    let question = message
+        .queries()
+        .first()
+        .ok_or_else(|| EcError::Runtime("dns response has no question".to_string()))?;
+    let mut records = HashMap::new();
+    for record in message.answers() {
+        if record.dns_class() == question.query_class()
+            && matches!(record.data(), RData::A(_) | RData::CNAME(_))
+        {
+            records
+                .entry(record.name())
+                .or_insert_with(Vec::new)
+                .push(record);
         }
     }
-    ips
-}
 
-fn extract_cname_aliases(message: &Message) -> Vec<String> {
-    let mut aliases = Vec::<String>::new();
-    for answer in message.answers() {
-        let RData::CNAME(cname) = answer.data() else {
-            continue;
-        };
-        let alias = normalize_dns_name(cname.to_string().as_str());
-        if !alias.is_empty() && !aliases.contains(&alias) {
-            aliases.push(alias);
+    let mut name = question.name();
+    let mut visited = HashSet::new();
+    let mut answer = DnsAnswer {
+        aliases: Vec::new(),
+        ips: Vec::new(),
+        ttl: DNS_CACHE_TTL,
+    };
+    loop {
+        if !visited.insert(name) {
+            return Err(EcError::Runtime(format!("dns CNAME loop at {name}")));
         }
+        let Some(records) = records.get(name) else {
+            break;
+        };
+        let mut alias = None;
+        for record in records {
+            answer.ttl = answer.ttl.min(Duration::from_secs(u64::from(record.ttl())));
+            match record.data() {
+                RData::CNAME(cname) => {
+                    if alias.is_some_and(|previous| previous != &cname.0) {
+                        return Err(EcError::Runtime(format!(
+                            "dns conflicting CNAME records for {name}"
+                        )));
+                    }
+                    alias = Some(&cname.0);
+                }
+                RData::A(ip) => {
+                    if !answer.ips.contains(&ip.0) {
+                        answer.ips.push(ip.0);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        let Some(next) = alias else {
+            break;
+        };
+        if !answer.ips.is_empty() {
+            return Err(EcError::Runtime(format!(
+                "dns CNAME and A records coexist for {name}"
+            )));
+        }
+        answer.aliases.push(normalize_dns_name(&next.to_string()));
+        name = next;
     }
-    aliases
+    if answer.aliases.is_empty() && answer.ips.is_empty() {
+        answer.ttl = Duration::ZERO;
+    }
+    Ok(answer)
 }
 
 fn normalize_dns_name(host: &str) -> String {
@@ -496,7 +523,7 @@ mod tests {
     }
 
     fn answer_message(alias_ttl: u32, address_ttl: u32) -> Message {
-        let mut message = Message::new();
+        let mut message = build_a_query("alias.example.test").unwrap();
         message.add_answer(Record::from_rdata(
             Name::from_ascii("alias.example.test.").unwrap(),
             alias_ttl,
@@ -520,18 +547,131 @@ mod tests {
             (60, 0, 0),
         ] {
             assert_eq!(
-                response_cache_ttl(&answer_message(alias_ttl, address_ttl)),
+                extract_answer(&answer_message(alias_ttl, address_ttl))
+                    .unwrap()
+                    .ttl,
                 Duration::from_secs(expected)
             );
         }
-        assert_eq!(response_cache_ttl(&Message::new()), Duration::ZERO);
+        let empty = build_a_query("empty.example.test").unwrap();
+        assert_eq!(extract_answer(&empty).unwrap().ttl, Duration::ZERO);
         let mut message = answer_message(60, 60);
         message.add_answer(Record::from_rdata(
             Name::from_ascii("origin.example.test.").unwrap(),
             10,
             RData::A(A(Ipv4Addr::new(192, 0, 2, 2))),
         ));
-        assert_eq!(response_cache_ttl(&message), Duration::from_secs(10));
+        assert_eq!(
+            extract_answer(&message).unwrap().ttl,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn answer_ignores_unrelated_names_classes_and_ttls() {
+        let mut message = build_a_query("requested.example.test").unwrap();
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("unrelated.example.test.").unwrap(),
+            0,
+            RData::CNAME(CNAME(Name::from_ascii("other.example.test.").unwrap())),
+        ));
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("other.example.test.").unwrap(),
+            0,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 99))),
+        ));
+        let mut wrong_class = Record::from_rdata(
+            Name::from_ascii("requested.example.test.").unwrap(),
+            0,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 98))),
+        );
+        wrong_class.set_dns_class(DNSClass::CH);
+        message.add_answer(wrong_class);
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("REQUESTED.example.test.").unwrap(),
+            60,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        let answer = extract_answer(&message).unwrap();
+        assert!(answer.aliases.is_empty());
+        assert_eq!(answer.ips, [Ipv4Addr::new(192, 0, 2, 1)]);
+        assert_eq!(answer.ttl, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn answer_follows_cname_chain_instead_of_record_order() {
+        let mut message = build_a_query("start.example.test").unwrap();
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("last.example.test.").unwrap(),
+            90,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 1))),
+        ));
+        for (owner, target, ttl) in [
+            ("middle.example.test.", "LAST.example.test.", 30),
+            ("START.example.test.", "middle.example.test.", 60),
+            ("start.example.test.", "MIDDLE.example.test.", 60),
+        ] {
+            message.add_answer(Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                ttl,
+                RData::CNAME(CNAME(Name::from_ascii(target).unwrap())),
+            ));
+        }
+        let answer = extract_answer(&message).unwrap();
+        assert_eq!(answer.aliases, ["middle.example.test", "last.example.test"]);
+        assert_eq!(answer.ips, [Ipv4Addr::new(192, 0, 2, 1)]);
+        assert_eq!(answer.ttl, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn answer_rejects_cname_loops_and_conflicting_data() {
+        for (owner, data, expected) in [
+            (
+                "origin.example.test.",
+                RData::CNAME(CNAME(Name::from_ascii("ALIAS.example.test.").unwrap())),
+                "loop",
+            ),
+            (
+                "origin.example.test.",
+                RData::CNAME(CNAME(Name::from_ascii("origin.example.test.").unwrap())),
+                "loop",
+            ),
+            (
+                "alias.example.test.",
+                RData::CNAME(CNAME(Name::from_ascii("other.example.test.").unwrap())),
+                "conflicting",
+            ),
+            (
+                "alias.example.test.",
+                RData::A(A(Ipv4Addr::new(192, 0, 2, 2))),
+                "coexist",
+            ),
+        ] {
+            let mut message = answer_message(60, 60);
+            message.answers_mut().pop();
+            message.add_answer(Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                60,
+                data,
+            ));
+            let error = extract_answer(&message).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn incomplete_cname_answer_preserves_only_the_connected_aliases() {
+        let mut message = answer_message(60, 60);
+        message.answers_mut().pop();
+        message.add_answer(Record::from_rdata(
+            Name::from_ascii("unrelated.example.test.").unwrap(),
+            1,
+            RData::A(A(Ipv4Addr::new(192, 0, 2, 99))),
+        ));
+        let answer = extract_answer(&message).unwrap();
+        assert_eq!(answer.aliases, ["origin.example.test"]);
+        assert!(answer.ips.is_empty());
+        assert_eq!(answer.ttl, Duration::from_secs(60));
     }
 
     #[test]
@@ -665,6 +805,51 @@ mod tests {
                 RData::A(A(ip)),
             ));
         response
+    }
+
+    #[test]
+    fn both_resolvers_skip_invalid_chains_and_try_the_next_server() {
+        let servers: Vec<_> = [true, false]
+            .into_iter()
+            .map(|invalid| {
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let server = socket.local_addr().unwrap();
+                let worker = thread::spawn(move || {
+                    for _ in 0..2 {
+                        let mut buf = [0; 4096];
+                        let (n, peer) = socket.recv_from(&mut buf).unwrap();
+                        let query = Message::from_vec(&buf[..n]).unwrap();
+                        let mut response = response_for(&query, Ipv4Addr::new(192, 0, 2, 7));
+                        if invalid {
+                            response.answers_mut().clear();
+                            let name = query.queries()[0].name().clone();
+                            response.add_answer(Record::from_rdata(
+                                name.clone(),
+                                60,
+                                RData::CNAME(CNAME(name)),
+                            ));
+                        }
+                        socket.send_to(&response.to_vec().unwrap(), peer).unwrap();
+                    }
+                });
+                (server, worker)
+            })
+            .collect();
+        let addresses: Vec<_> = servers.iter().map(|(addr, _)| *addr).collect();
+        let host = format!("chain-failover-{}.example.test", addresses[0].port());
+        let direct = resolve_first_ipv4(i32::MIN, &host, &addresses).unwrap();
+        assert_eq!(direct.ip, Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(direct.source, ResolveSource::Server(addresses[1]));
+        let lookup = resolve_lookup(&host, &addresses).unwrap();
+        assert_eq!(lookup.ips, [Ipv4Addr::new(192, 0, 2, 7)]);
+        assert!(lookup.aliases.is_empty());
+        assert_eq!(lookup.source, ResolveSource::Server(addresses[1]));
+        for (_, worker) in servers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]

@@ -195,7 +195,7 @@ impl RouteMatcher {
             return plan_ipv6_fallback(ip, port);
         }
         if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
-            return self.plan_remote_with_rule(rule, host, port, &target);
+            return self.plan_remote_with_rule(rule, host, port, &target, None);
         }
 
         if let TargetKind::Domain(domain) = &target
@@ -222,6 +222,7 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         target: &TargetKind,
+        resolved: Option<crate::dns_resolver::ResolveResult>,
     ) -> RoutePlan {
         match target {
             TargetKind::Ipv4(ip) => RoutePlan::Remote {
@@ -247,7 +248,7 @@ impl RouteMatcher {
                         dns_lookup: None,
                     };
                 }
-                if self.dns_servers.is_empty() {
+                if resolved.is_none() && self.dns_servers.is_empty() {
                     return RoutePlan::Fallback {
                         target: format!("{host}:{port}"),
                         reason: "hostname matched a route rule but dns.data entry is missing and DNS servers are unavailable"
@@ -255,8 +256,10 @@ impl RouteMatcher {
                     };
                 }
 
-                match crate::dns_resolver::resolve_first_ipv4(rule.rc_id, domain, &self.dns_servers)
-                {
+                let resolved = resolved.map(Ok).unwrap_or_else(|| {
+                    crate::dns_resolver::resolve_first_ipv4(rule.rc_id, domain, &self.dns_servers)
+                });
+                match resolved {
                     Ok(resolved) => {
                         let dns_lookup = resolved.source;
                         RoutePlan::Remote {
@@ -294,9 +297,7 @@ impl RouteMatcher {
             return None;
         }
         let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
-        if let Some(plan) =
-            self.plan_from_cname_aliases(host, port, &resolved.aliases, resolved.source)
-        {
+        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved) {
             return Some(plan);
         }
         let dns_lookup = resolved.source;
@@ -312,10 +313,9 @@ impl RouteMatcher {
         &self,
         host: &str,
         port: u16,
-        aliases: &[String],
-        dns_lookup: crate::dns_resolver::ResolveSource,
+        resolved: &crate::dns_resolver::LookupResolveResult,
     ) -> Option<RoutePlan> {
-        for alias in aliases {
+        for alias in &resolved.aliases {
             let alias = normalize_domain(alias);
             if alias.is_empty() || Ipv4Addr::from_str(&alias).is_ok() {
                 continue;
@@ -323,8 +323,8 @@ impl RouteMatcher {
             let target = TargetKind::Domain(alias);
             if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
                 return Some(
-                    self.plan_remote_with_cname_rule(rule, host, port, &target)
-                        .with_dns_lookup_if_absent(dns_lookup),
+                    self.plan_remote_with_cname_rule(rule, host, port, &target, resolved)
+                        .with_dns_lookup_if_absent(resolved.source),
                 );
             }
         }
@@ -372,8 +372,16 @@ impl RouteMatcher {
         host: &str,
         port: u16,
         target: &TargetKind,
+        resolved: &crate::dns_resolver::LookupResolveResult,
     ) -> RoutePlan {
-        match self.plan_remote_with_rule(rule, host, port, target) {
+        let address = resolved
+            .ips
+            .first()
+            .map(|&ip| crate::dns_resolver::ResolveResult {
+                ip,
+                source: resolved.source,
+            });
+        match self.plan_remote_with_rule(rule, host, port, target, address) {
             RoutePlan::Remote {
                 dial,
                 rc_id,
@@ -1075,8 +1083,13 @@ mod tests {
             .plan_from_cname_aliases(
                 "estudent.shiep.edu.cn",
                 443,
-                &["lgwf0-46.shiep.edu.cn".to_string()],
-                crate::dns_resolver::ResolveSource::Server("127.0.0.1:53".parse().unwrap()),
+                &crate::dns_resolver::LookupResolveResult {
+                    aliases: vec!["lgwf0-46.shiep.edu.cn".to_string()],
+                    ips: vec!["192.0.2.99".parse().unwrap()],
+                    source: crate::dns_resolver::ResolveSource::Server(
+                        "127.0.0.1:53".parse().unwrap(),
+                    ),
+                },
             )
             .unwrap();
         match plan {
@@ -1122,10 +1135,148 @@ mod tests {
         let plan = matcher.plan_from_cname_aliases(
             "estudent.shiep.edu.cn",
             443,
-            &["10.166.64.6".to_string()],
-            crate::dns_resolver::ResolveSource::Cache,
+            &crate::dns_resolver::LookupResolveResult {
+                aliases: vec!["10.166.64.6".to_string()],
+                ips: vec![],
+                source: crate::dns_resolver::ResolveSource::Cache,
+            },
         );
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn cname_routing_reuses_complete_answers_and_queries_only_missing_addresses() {
+        use crate::dns_resolver::ResolveSource;
+        use hickory_proto::op::{Message, MessageType};
+        use hickory_proto::rr::{
+            Name, RData, Record,
+            rdata::{A, CNAME},
+        };
+        use std::net::{Ipv4Addr, UdpSocket};
+        use std::thread;
+        use std::time::Duration;
+
+        for (complete, mapped) in [(true, false), (true, true), (false, false)] {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let server = socket.local_addr().unwrap();
+            let scope = format!("cname-{}-{complete}-{mapped}.example.test", server.port());
+            let host = format!("entry.{scope}");
+            let alias = format!("target.{scope}");
+            let canonical = Name::from_ascii(format!("{alias}.")).unwrap();
+            let worker = thread::spawn(move || {
+                let mut queries = Vec::new();
+                for index in 0..if complete { 1 } else { 2 } {
+                    let mut buf = [0; 4096];
+                    let (n, peer) = socket.recv_from(&mut buf).unwrap();
+                    let query = Message::from_vec(&buf[..n]).unwrap();
+                    queries.push(query.queries()[0].name().to_string());
+                    let mut response = query.clone();
+                    response.set_message_type(MessageType::Response);
+                    if index == 0 {
+                        response.add_answer(Record::from_rdata(
+                            query.queries()[0].name().clone(),
+                            60,
+                            RData::CNAME(CNAME(canonical.clone())),
+                        ));
+                    }
+                    if complete || index == 1 {
+                        response.add_answer(Record::from_rdata(
+                            canonical.clone(),
+                            60,
+                            RData::A(A(Ipv4Addr::new(192, 0, 2, 44))),
+                        ));
+                    }
+                    socket.send_to(&response.to_vec().unwrap(), peer).unwrap();
+                }
+                (socket, queries)
+            });
+            let matcher = RouteMatcher::from_table(RouteTable {
+                rules: vec![
+                    domain_rule(1, &alias),
+                    domain_rule(2, &format!("sibling.{scope}")),
+                ],
+                dns_servers: vec![server.to_string()],
+                dns_records: if mapped {
+                    vec![DnsRecord {
+                        rc_id: 1,
+                        host: alias.clone(),
+                        ip: "192.0.2.88".to_string(),
+                    }]
+                } else {
+                    vec![]
+                },
+            })
+            .unwrap();
+            let plan = matcher.plan(&host, 443);
+            let (socket, queries) = worker.join().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let extra_query = socket.recv_from(&mut [0; 4096]);
+            assert_eq!(
+                extra_query.unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "unexpected extra DNS query"
+            );
+            let expected_queries = if complete {
+                vec![format!("{host}.")]
+            } else {
+                vec![format!("{host}."), format!("{alias}.")]
+            };
+            assert_eq!(queries, expected_queries);
+            let RoutePlan::Remote {
+                dial,
+                rc_id,
+                source,
+                dns_lookup,
+                ..
+            } = plan
+            else {
+                panic!("expected remote plan, got {plan:?}");
+            };
+            assert_eq!(rc_id, 1);
+            assert_eq!(dns_lookup, Some(ResolveSource::Server(server)));
+            assert_eq!(
+                dial,
+                if mapped {
+                    "192.0.2.88:443"
+                } else {
+                    "192.0.2.44:443"
+                }
+            );
+            assert_eq!(
+                source,
+                if mapped {
+                    RouteSource::CnameDnsMap
+                } else {
+                    RouteSource::CnameDnsServer
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn cname_cached_answer_reuses_its_address_and_provenance() {
+        use crate::dns_resolver::{LookupResolveResult, ResolveSource};
+
+        let matcher = RouteMatcher::from_table(RouteTable {
+            rules: vec![domain_rule(1, "target.example.test")],
+            dns_servers: vec![],
+            dns_records: vec![],
+        })
+        .unwrap();
+        let result = LookupResolveResult {
+            aliases: vec!["target.example.test".to_string()],
+            ips: vec!["192.0.2.44".parse().unwrap()],
+            source: ResolveSource::Cache,
+        };
+        let plan = matcher
+            .plan_from_cname_aliases("entry.example.test", 443, &result)
+            .unwrap();
+        assert!(matches!(plan, RoutePlan::Remote {
+            dial, source: RouteSource::CnameDnsServer, dns_lookup: Some(ResolveSource::Cache), ..
+        } if dial == "192.0.2.44:443"));
     }
 
     #[test]
