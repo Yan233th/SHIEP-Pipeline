@@ -85,7 +85,7 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
                 control_tx: control,
                 rx: opened.uplink_rx,
                 pending: false,
-                eof: false,
+                finished: false,
             },
         }),
         Ok(Err(e)) => Err(e),
@@ -145,13 +145,20 @@ impl Drop for TunnelTcpSender {
 pub struct TunnelTcpReceiver {
     id: u64,
     control_tx: mpsc::Sender<ControlMessage>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<EcResult<TunnelTcpRead>>,
     pending: bool,
-    eof: bool,
+    finished: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TunnelTcpRead {
+    Data(Vec<u8>),
+    Eof,
+    Closed,
 }
 
 impl TunnelTcpReceiver {
-    pub fn recv(&mut self) -> Result<Vec<u8>, mpsc::RecvError> {
+    pub fn recv(&mut self) -> EcResult<TunnelTcpRead> {
         // Asking for the next chunk acknowledges consumption of the previous one.
         if self.pending {
             let _ = self
@@ -159,22 +166,20 @@ impl TunnelTcpReceiver {
                 .send(ControlMessage::Received { id: self.id });
             self.pending = false;
         }
-        match self.rx.recv() {
-            Ok(chunk) => {
-                self.pending = true;
-                Ok(chunk)
-            }
-            Err(err) => {
-                self.eof = true;
-                Err(err)
-            }
-        }
+        let result = self.rx.recv().unwrap_or_else(|_| {
+            Err(EcError::Runtime(
+                "netstack receive channel disconnected".to_string(),
+            ))
+        });
+        self.pending = matches!(result, Ok(TunnelTcpRead::Data(_)));
+        self.finished = matches!(result, Ok(TunnelTcpRead::Closed) | Err(_));
+        result
     }
 }
 
 impl Drop for TunnelTcpReceiver {
     fn drop(&mut self) {
-        if !self.eof {
+        if !self.finished {
             let _ = self.control_tx.send(ControlMessage::Abort { id: self.id });
         }
     }
@@ -205,16 +210,18 @@ enum ControlMessage {
 
 struct OpenedTcpConnection {
     id: u64,
-    uplink_rx: mpsc::Receiver<Vec<u8>>,
+    uplink_rx: mpsc::Receiver<EcResult<TunnelTcpRead>>,
     send_result_rx: mpsc::Receiver<EcResult<()>>,
 }
 
 struct ConnectionState {
     handle: SocketHandle,
-    uplink: Option<mpsc::Sender<Vec<u8>>>,
+    uplink: mpsc::Sender<EcResult<TunnelTcpRead>>,
     send_result: mpsc::Sender<EcResult<()>>,
     pending_send: Option<PendingSend>,
     receive_pending: bool,
+    remote_fin: bool,
+    receive_eof: bool,
     aborted: bool,
     close_requested: bool,
     opening: Option<PendingOpen>,
@@ -435,7 +442,7 @@ fn open_connection(
 
     match connect_result {
         Ok(()) => {
-            let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>();
+            let (uplink_tx, uplink_rx) = mpsc::channel();
             let (send_result_tx, send_result_rx) = mpsc::channel::<EcResult<()>>();
             let id = *next_conn_id;
             *next_conn_id = (*next_conn_id).wrapping_add(1);
@@ -443,10 +450,12 @@ fn open_connection(
                 id,
                 ConnectionState {
                     handle,
-                    uplink: Some(uplink_tx),
+                    uplink: uplink_tx,
                     send_result: send_result_tx,
                     pending_send: None,
                     receive_pending: false,
+                    remote_fin: false,
+                    receive_eof: false,
                     aborted: false,
                     close_requested: false,
                     opening: None,
@@ -501,6 +510,11 @@ fn drive_connections(
 
         // An abort gets one interface poll to dispatch its RST before removal.
         if conn.aborted {
+            // The relay that cancelled the connection already owns its error, if any.
+            let _ = conn.uplink.send(Ok(TunnelTcpRead::Closed));
+            if conn.pending_send.is_some() {
+                fail_pending_send(conn, EcError::Runtime("tcp connection aborted".to_string()));
+            }
             remove_ids.push(*id);
             continue;
         }
@@ -536,6 +550,21 @@ fn drive_connections(
             }
         }
 
+        if matches!(
+            socket.state(),
+            tcp::State::CloseWait
+                | tcp::State::LastAck
+                | tcp::State::Closing
+                | tcp::State::TimeWait
+        ) {
+            conn.remote_fin = true;
+        }
+        if socket.state() == tcp::State::Closed && !(conn.close_requested && conn.remote_fin) {
+            fail_connection(conn, "tcp connection reset by peer");
+            remove_ids.push(*id);
+            continue;
+        }
+
         pump_pending_sends(socket, conn);
         pump_uplink_reads(socket, conn);
 
@@ -552,6 +581,7 @@ fn drive_connections(
                 );
             }
             if !socket.can_recv() && !conn.aborted {
+                let _ = conn.uplink.send(Ok(TunnelTcpRead::Closed));
                 remove_ids.push(*id);
             }
         }
@@ -561,6 +591,13 @@ fn drive_connections(
         if let Some(conn) = connections.remove(&id) {
             let _ = sockets.remove(conn.handle);
         }
+    }
+}
+
+fn fail_connection(conn: &mut ConnectionState, reason: &str) {
+    let _ = conn.uplink.send(Err(EcError::Runtime(reason.to_string())));
+    if conn.pending_send.is_some() {
+        fail_pending_send(conn, EcError::Runtime(reason.to_string()));
     }
 }
 
@@ -610,15 +647,19 @@ fn fail_pending_send(conn: &mut ConnectionState, err: EcError) {
 }
 
 fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
-    let Some(uplink) = conn.uplink.as_ref() else {
+    if conn.receive_eof {
         return;
-    };
+    }
     if !conn.receive_pending && socket.can_recv() {
         let mut buf = [0u8; RECEIVE_CHUNK_SIZE];
         match socket.recv_slice(&mut buf) {
             Ok(0) => {}
             Ok(n) => {
-                if uplink.send(buf[..n].to_vec()).is_err() {
+                if conn
+                    .uplink
+                    .send(Ok(TunnelTcpRead::Data(buf[..n].to_vec())))
+                    .is_err()
+                {
                     conn.aborted = true;
                     socket.abort();
                     return;
@@ -635,7 +676,8 @@ fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
             tcp::State::SynSent | tcp::State::SynReceived
         )
     {
-        conn.uplink = None;
+        conn.receive_eof = true;
+        let _ = conn.uplink.send(Ok(TunnelTcpRead::Eof));
     }
 }
 

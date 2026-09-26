@@ -1,5 +1,7 @@
 use super::*;
 use smoltcp::phy::{Loopback, Medium};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 
 struct Rig {
     device: Loopback,
@@ -89,6 +91,248 @@ impl Rig {
         assert_eq!(self.client().state(), tcp::State::Established);
         self.opened = Some(self.reply.try_recv().unwrap().unwrap());
     }
+
+    fn tunnel_connection(&mut self) -> (TunnelTcpConnection, mpsc::Receiver<ControlMessage>) {
+        let opened = self.opened.take().unwrap();
+        let (control_tx, control_rx) = mpsc::channel();
+        let conn = TunnelTcpConnection {
+            sender: TunnelTcpSender {
+                id: opened.id,
+                control_tx: control_tx.clone(),
+                send_result_rx: opened.send_result_rx,
+                closed: false,
+            },
+            receiver: TunnelTcpReceiver {
+                id: opened.id,
+                control_tx,
+                rx: opened.uplink_rx,
+                pending: false,
+                finished: false,
+            },
+        };
+        (conn, control_rx)
+    }
+
+    fn control(&mut self, message: ControlMessage) {
+        handle_control_message(
+            message,
+            &mut ControlDispatch {
+                device: &mut TunnelDevice::new(),
+                iface: &mut self.iface,
+                sockets: &mut self.sockets,
+                connections: &mut self.connections,
+                next_conn_id: &mut 2,
+                next_local_port: &mut 40001,
+                now: SmolInstant::from_millis(self.clock),
+            },
+        );
+        self.steps(10);
+    }
+}
+
+#[test]
+fn remote_reset_ends_the_relay_without_waiting_for_client_eof() {
+    for fin_before_reset in [false, true] {
+        let mut rig = Rig::new();
+        rig.establish();
+        let (conn, _control_rx) = rig.tunnel_connection();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (relay_client, _) = listener.accept().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = done_tx.send(crate::socks::relay_tunnel(relay_client, conn));
+        });
+        if fin_before_reset {
+            rig.sockets.get_mut::<tcp::Socket>(rig.server).close();
+            rig.steps(10);
+            assert_eq!(client.read(&mut [0]).unwrap(), 0);
+            assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+        rig.sockets.get_mut::<tcp::Socket>(rig.server).abort();
+        rig.steps(10);
+        assert!(rig.connections.is_empty());
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote reset left the relay waiting for client EOF");
+        assert_eq!(
+            crate::error::concise_error(result.unwrap_err()),
+            "tcp connection reset by peer"
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn tunnel_relay_fin_allows_upload_and_then_exits_cleanly() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let (conn, control_rx) = rig.tunnel_connection();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (relay_client, _) = listener.accept().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let relay = thread::spawn(move || {
+        let _ = done_tx.send(crate::socks::relay_tunnel(relay_client, conn));
+    });
+    let peer = thread::spawn(move || {
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        assert_eq!(response, vec![7; 8192]);
+        client.write_all(b"after EOF").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+    });
+    rig.sockets
+        .get_mut::<tcp::Socket>(rig.server)
+        .send_slice(&[7; 8192])
+        .unwrap();
+    rig.sockets.get_mut::<tcp::Socket>(rig.server).close();
+    rig.steps(10);
+    for _ in 0..8 {
+        let message = control_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let closing = matches!(message, ControlMessage::Close { .. });
+        rig.control(message);
+        if closing {
+            break;
+        }
+    }
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok()
+    );
+    assert!(rig.connections.is_empty());
+    let mut upload = [0; 32];
+    let n = rig
+        .sockets
+        .get_mut::<tcp::Socket>(rig.server)
+        .recv_slice(&mut upload)
+        .unwrap();
+    assert_eq!(&upload[..n], b"after EOF");
+    peer.join().unwrap();
+    relay.join().unwrap();
+}
+
+#[test]
+fn remote_reset_wakes_a_sender_blocked_on_admission() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let handle = rig.connections[&1].handle;
+    rig.sockets
+        .get_mut::<tcp::Socket>(handle)
+        .send_slice(&[1; SOCKET_BUFFER_CAPACITY])
+        .unwrap();
+    rig.connections.get_mut(&1).unwrap().pending_send = Some(PendingSend::new(vec![2]));
+    rig.sockets.get_mut::<tcp::Socket>(rig.server).abort();
+    rig.steps(10);
+    let err = rig
+        .opened
+        .as_ref()
+        .unwrap()
+        .send_result_rx
+        .try_recv()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        crate::error::concise_error(err),
+        "tcp connection reset by peer"
+    );
+    assert!(rig.connections.is_empty());
+}
+
+#[test]
+fn client_cancellation_does_not_become_an_upstream_failure() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let (conn, control_rx) = rig.tunnel_connection();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (relay_client, _) = listener.accept().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let relay = thread::spawn(move || {
+        let _ = done_tx.send(crate::socks::relay_tunnel(relay_client, conn));
+    });
+    socket2::SockRef::from(&client)
+        .set_linger(Some(Duration::ZERO))
+        .unwrap();
+    drop(client);
+    let message = control_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(message, ControlMessage::Abort { .. }));
+    rig.control(message);
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok()
+    );
+    assert!(rig.connections.is_empty());
+    relay.join().unwrap();
+}
+
+#[test]
+fn complete_close_still_delivers_buffered_response_before_eof() {
+    let mut rig = Rig::new();
+    rig.establish();
+    rig.control(ControlMessage::Close { id: 1 });
+    rig.sockets
+        .get_mut::<tcp::Socket>(rig.server)
+        .send_slice(&[9; 8192])
+        .unwrap();
+    rig.sockets.get_mut::<tcp::Socket>(rig.server).close();
+    rig.steps(10);
+    assert_eq!(rig.client().state(), tcp::State::TimeWait);
+    let mut received = Vec::new();
+    let mut eof = false;
+    let mut closed = false;
+    for _ in 0..8 {
+        while let Ok(event) = rig.opened.as_ref().unwrap().uplink_rx.try_recv() {
+            match event.unwrap() {
+                TunnelTcpRead::Data(chunk) => {
+                    assert!(!eof && !closed);
+                    received.extend(chunk);
+                    rig.control(ControlMessage::Received { id: 1 });
+                }
+                TunnelTcpRead::Eof => {
+                    assert!(!eof);
+                    eof = true;
+                }
+                TunnelTcpRead::Closed => {
+                    assert!(eof);
+                    closed = true;
+                }
+            }
+        }
+        rig.steps(10);
+    }
+    assert_eq!(received, [9; 8192]);
+    assert!(closed);
+    assert!(rig.connections.is_empty());
+}
+
+#[test]
+fn unexpected_receive_channel_loss_is_an_error() {
+    let (control_tx, _control_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let mut receiver = TunnelTcpReceiver {
+        id: 1,
+        control_tx,
+        rx,
+        pending: false,
+        finished: false,
+    };
+    drop(tx);
+    assert_eq!(
+        crate::error::concise_error(receiver.recv().unwrap_err()),
+        "netstack receive channel disconnected"
+    );
 }
 
 #[test]
@@ -103,17 +347,26 @@ fn remote_fin_delivers_buffered_data_then_eof_without_closing_upload() {
 
     assert_eq!(rig.client().state(), tcp::State::CloseWait);
     let mut received = Vec::new();
+    let mut eof = false;
     for _ in 0..10 {
-        if let Ok(chunk) = rig.opened.as_ref().unwrap().uplink_rx.try_recv() {
-            received.extend(chunk);
-            rig.connections.get_mut(&1).unwrap().receive_pending = false;
+        if let Ok(event) = rig.opened.as_ref().unwrap().uplink_rx.try_recv() {
+            match event.unwrap() {
+                TunnelTcpRead::Data(chunk) => {
+                    assert!(!eof);
+                    received.extend(chunk);
+                    rig.connections.get_mut(&1).unwrap().receive_pending = false;
+                }
+                TunnelTcpRead::Eof => eof = true,
+                TunnelTcpRead::Closed => panic!("upload half closed prematurely"),
+            }
         }
         rig.steps(4);
     }
     assert_eq!(received, response);
+    assert!(eof);
     assert!(matches!(
         rig.opened.as_ref().unwrap().uplink_rx.try_recv(),
-        Err(mpsc::TryRecvError::Disconnected)
+        Err(mpsc::TryRecvError::Empty)
     ));
 
     let conn = rig.connections.get_mut(&1).unwrap();
@@ -133,6 +386,23 @@ fn remote_fin_delivers_buffered_data_then_eof_without_closing_upload() {
     let mut bytes = [0; 32];
     let n = server.recv_slice(&mut bytes).unwrap();
     assert_eq!(&bytes[..n], b"last upload");
+    assert_eq!(
+        rig.opened
+            .as_ref()
+            .unwrap()
+            .uplink_rx
+            .try_recv()
+            .unwrap()
+            .unwrap(),
+        TunnelTcpRead::Closed
+    );
+}
+
+fn received_data(event: EcResult<TunnelTcpRead>) -> Vec<u8> {
+    match event.unwrap() {
+        TunnelTcpRead::Data(chunk) => chunk,
+        other => panic!("expected data, got {other:?}"),
+    }
 }
 
 #[test]
@@ -168,7 +438,7 @@ fn slow_reader_bounds_download_buffering_and_resumes_without_loss() {
     }
     // Include the peer's send buffer: it must stop admitting new data as our window closes.
     assert!(admitted <= 2 * SOCKET_BUFFER_CAPACITY + RECEIVE_CHUNK_SIZE);
-    let first = rig.opened.as_ref().unwrap().uplink_rx.try_recv().unwrap();
+    let first = received_data(rig.opened.as_ref().unwrap().uplink_rx.try_recv().unwrap());
     assert!(first.len() <= RECEIVE_CHUNK_SIZE);
     assert!(matches!(
         rig.opened.as_ref().unwrap().uplink_rx.try_recv(),
@@ -179,7 +449,14 @@ fn slow_reader_bounds_download_buffering_and_resumes_without_loss() {
     for _ in 0..256 {
         rig.connections.get_mut(&1).unwrap().receive_pending = false;
         rig.steps(8);
-        received.extend(rig.opened.as_ref().unwrap().uplink_rx.try_iter().flatten());
+        received.extend(
+            rig.opened
+                .as_ref()
+                .unwrap()
+                .uplink_rx
+                .try_iter()
+                .flat_map(received_data),
+        );
     }
     assert_eq!(received, vec![0x5a; admitted]);
 }
@@ -225,16 +502,16 @@ fn receiver_acknowledges_only_on_next_read_and_cancels_on_early_drop() {
         control_tx,
         rx,
         pending: false,
-        eof: false,
+        finished: false,
     };
-    tx.send(vec![1]).unwrap();
-    assert_eq!(receiver.recv().unwrap(), [1]);
+    tx.send(Ok(TunnelTcpRead::Data(vec![1]))).unwrap();
+    assert_eq!(received_data(receiver.recv()), [1]);
     assert!(matches!(
         control_rx.try_recv(),
         Err(mpsc::TryRecvError::Empty)
     ));
-    tx.send(vec![2]).unwrap();
-    assert_eq!(receiver.recv().unwrap(), [2]);
+    tx.send(Ok(TunnelTcpRead::Data(vec![2]))).unwrap();
+    assert_eq!(received_data(receiver.recv()), [2]);
     assert!(matches!(
         control_rx.try_recv(),
         Ok(ControlMessage::Received { id: 1 })
@@ -255,10 +532,16 @@ fn receiver_eof_preserves_the_upload_half() {
         control_tx,
         rx,
         pending: false,
-        eof: false,
+        finished: false,
     };
-    drop(tx);
-    assert!(receiver.recv().is_err());
+    tx.send(Ok(TunnelTcpRead::Eof)).unwrap();
+    assert_eq!(receiver.recv().unwrap(), TunnelTcpRead::Eof);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    tx.send(Ok(TunnelTcpRead::Closed)).unwrap();
+    assert_eq!(receiver.recv().unwrap(), TunnelTcpRead::Closed);
     drop(receiver);
     assert!(matches!(
         control_rx.try_recv(),
@@ -298,7 +581,10 @@ fn a_stalled_reader_does_not_block_another_connection() {
         .send_slice(b"independent")
         .unwrap();
     rig.steps(10);
-    assert_eq!(opened.uplink_rx.try_recv().unwrap(), b"independent");
+    assert_eq!(
+        received_data(opened.uplink_rx.try_recv().unwrap()),
+        b"independent"
+    );
     assert!(rig.connections[&1].receive_pending);
 }
 

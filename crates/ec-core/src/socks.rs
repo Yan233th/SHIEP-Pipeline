@@ -389,7 +389,10 @@ fn relay_direct_with_reply(
     relay_direct(client, conn).map_err(|e| route_runtime_error(target_display, route_path, e))
 }
 
-fn relay_tunnel(mut client: TcpStream, conn: crate::netstack::TunnelTcpConnection) -> EcResult<()> {
+pub(crate) fn relay_tunnel(
+    mut client: TcpStream,
+    conn: crate::netstack::TunnelTcpConnection,
+) -> EcResult<()> {
     let (sender, rx) = conn.into_parts();
     let c_to_r_src = client
         .try_clone()
@@ -441,16 +444,24 @@ fn relay_tunnel_to_client(
     client: &mut TcpStream,
     mut rx: crate::netstack::TunnelTcpReceiver,
 ) -> EcResult<()> {
-    while let Ok(chunk) = rx.recv() {
-        if chunk.is_empty() {
-            continue;
-        }
+    loop {
+        let chunk = match rx.recv() {
+            Ok(crate::netstack::TunnelTcpRead::Data(chunk)) => chunk,
+            Ok(crate::netstack::TunnelTcpRead::Eof) => {
+                shutdown_write(client, "client")?;
+                continue;
+            }
+            Ok(crate::netstack::TunnelTcpRead::Closed) => return Ok(()),
+            Err(err) => {
+                let _ = client.shutdown(Shutdown::Both);
+                return Err(err);
+            }
+        };
         if let Err(err) = client.write_all(&chunk) {
             let _ = client.shutdown(Shutdown::Both);
             return relay_io_result(err, "tunnel to client write");
         }
     }
-    shutdown_write(client, "client")
 }
 
 fn pump_stream(mut src: TcpStream, mut dst: TcpStream, direction: &'static str) -> EcResult<()> {
