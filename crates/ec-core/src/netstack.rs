@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static CONTROL_TX: OnceLock<mpsc::Sender<ControlMessage>> = OnceLock::new();
 const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
+const RECEIVE_CHUNK_SIZE: usize = 4096;
 const MAX_CONTROL_BATCH: usize = 64;
 const NETSTACK_CONTROL_DISCONNECTED: &str = "netstack control channel disconnected";
 
@@ -94,14 +95,20 @@ pub struct TunnelTcpConnection {
 }
 
 impl TunnelTcpConnection {
-    pub fn into_parts(self) -> (TunnelTcpSender, mpsc::Receiver<Vec<u8>>) {
+    pub fn into_parts(self) -> (TunnelTcpSender, TunnelTcpReceiver) {
         (
             TunnelTcpSender {
                 id: self.id,
-                control_tx: self.control_tx,
+                control_tx: self.control_tx.clone(),
                 send_result_rx: self.send_result_rx,
             },
-            self.rx,
+            TunnelTcpReceiver {
+                id: self.id,
+                control_tx: self.control_tx,
+                rx: self.rx,
+                pending: false,
+                eof: false,
+            },
         )
     }
 }
@@ -130,6 +137,45 @@ impl TunnelTcpSender {
     }
 }
 
+#[derive(Debug)]
+pub struct TunnelTcpReceiver {
+    id: u64,
+    control_tx: mpsc::Sender<ControlMessage>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    pending: bool,
+    eof: bool,
+}
+
+impl TunnelTcpReceiver {
+    pub fn recv(&mut self) -> Result<Vec<u8>, mpsc::RecvError> {
+        // Asking for the next chunk acknowledges consumption of the previous one.
+        if self.pending {
+            let _ = self
+                .control_tx
+                .send(ControlMessage::Received { id: self.id });
+            self.pending = false;
+        }
+        match self.rx.recv() {
+            Ok(chunk) => {
+                self.pending = true;
+                Ok(chunk)
+            }
+            Err(err) => {
+                self.eof = true;
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for TunnelTcpReceiver {
+    fn drop(&mut self) {
+        if !self.eof {
+            let _ = self.control_tx.send(ControlMessage::Abort { id: self.id });
+        }
+    }
+}
+
 enum ControlMessage {
     TunnelPacket {
         packet: Vec<u8>,
@@ -145,6 +191,12 @@ enum ControlMessage {
     Close {
         id: u64,
     },
+    Received {
+        id: u64,
+    },
+    Abort {
+        id: u64,
+    },
 }
 
 struct OpenedTcpConnection {
@@ -158,6 +210,8 @@ struct ConnectionState {
     uplink: Option<mpsc::Sender<Vec<u8>>>,
     send_result: mpsc::Sender<EcResult<()>>,
     pending_send: Option<PendingSend>,
+    receive_pending: bool,
+    aborted: bool,
     close_requested: bool,
 }
 
@@ -292,6 +346,17 @@ fn handle_control_message(msg: ControlMessage, dispatch: &mut ControlDispatch<'_
                 conn.close_requested = true;
             }
         }
+        ControlMessage::Received { id } => {
+            if let Some(conn) = dispatch.connections.get_mut(&id) {
+                conn.receive_pending = false;
+            }
+        }
+        ControlMessage::Abort { id } => {
+            if let Some(conn) = dispatch.connections.get_mut(&id) {
+                conn.aborted = true;
+                dispatch.sockets.get_mut::<tcp::Socket>(conn.handle).abort();
+            }
+        }
     }
 }
 
@@ -352,6 +417,8 @@ fn open_connection(
                     uplink: Some(uplink_tx),
                     send_result: send_result_tx,
                     pending_send: None,
+                    receive_pending: false,
+                    aborted: false,
                     close_requested: false,
                 },
             );
@@ -373,13 +440,19 @@ fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64,
     for (id, conn) in connections.iter_mut() {
         let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
 
+        // An abort gets one interface poll to dispatch its RST before removal.
+        if conn.aborted {
+            remove_ids.push(*id);
+            continue;
+        }
+
         pump_pending_sends(socket, conn);
         pump_uplink_reads(socket, conn);
 
         if conn.close_requested && conn.pending_send.is_none() && socket.may_send() {
             socket.close();
         }
-        if !socket.is_open() {
+        if !socket.is_open() && !socket.can_recv() && !conn.aborted {
             if conn.pending_send.is_some() {
                 fail_pending_send(
                     conn,
@@ -448,17 +521,19 @@ fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
     let Some(uplink) = conn.uplink.as_ref() else {
         return;
     };
-    while socket.can_recv() {
-        let mut buf = [0u8; 4096];
+    if !conn.receive_pending && socket.can_recv() {
+        let mut buf = [0u8; RECEIVE_CHUNK_SIZE];
         match socket.recv_slice(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {}
             Ok(n) => {
                 if uplink.send(buf[..n].to_vec()).is_err() {
-                    conn.close_requested = true;
-                    break;
+                    conn.aborted = true;
+                    socket.abort();
+                    return;
                 }
+                conn.receive_pending = true;
             }
-            Err(_) => break,
+            Err(_) => {}
         }
     }
     // EOF belongs to the receive half; the peer may still be waiting for our data.

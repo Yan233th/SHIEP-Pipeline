@@ -89,7 +89,17 @@ fn remote_fin_delivers_buffered_data_then_eof_without_closing_upload() {
     rig.steps(10);
 
     assert_eq!(rig.client().state(), tcp::State::CloseWait);
-    let received: Vec<u8> = rig.opened.uplink_rx.try_iter().flatten().collect();
+    let mut received = Vec::new();
+    for _ in 0..10 {
+        if let Ok(chunk) = rig.opened.uplink_rx.try_recv() {
+            received.extend(chunk);
+            rig.connections
+                .get_mut(&rig.opened.id)
+                .unwrap()
+                .receive_pending = false;
+        }
+        rig.steps(4);
+    }
     assert_eq!(received, response);
     assert!(matches!(
         rig.opened.uplink_rx.try_recv(),
@@ -116,4 +126,152 @@ fn waiting_for_handshake_is_not_receive_eof() {
         rig.opened.uplink_rx.try_recv(),
         Err(mpsc::TryRecvError::Empty)
     ));
+}
+
+#[test]
+fn slow_reader_bounds_download_buffering_and_resumes_without_loss() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let chunk = vec![0x5a; RECEIVE_CHUNK_SIZE];
+    let mut admitted = 0;
+    for _ in 0..256 {
+        admitted += rig
+            .sockets
+            .get_mut::<tcp::Socket>(rig.server)
+            .send_slice(&chunk)
+            .unwrap();
+        rig.steps(8);
+    }
+    // Include the peer's send buffer: it must stop admitting new data as our window closes.
+    assert!(admitted <= 2 * SOCKET_BUFFER_CAPACITY + RECEIVE_CHUNK_SIZE);
+    let first = rig.opened.uplink_rx.try_recv().unwrap();
+    assert!(first.len() <= RECEIVE_CHUNK_SIZE);
+    assert!(matches!(
+        rig.opened.uplink_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    let mut received = first;
+    for _ in 0..256 {
+        rig.connections
+            .get_mut(&rig.opened.id)
+            .unwrap()
+            .receive_pending = false;
+        rig.steps(8);
+        received.extend(rig.opened.uplink_rx.try_iter().flatten());
+    }
+    assert_eq!(received, vec![0x5a; admitted]);
+}
+
+#[test]
+fn stalled_download_does_not_block_upload() {
+    let mut rig = Rig::new();
+    rig.establish();
+    rig.sockets
+        .get_mut::<tcp::Socket>(rig.server)
+        .send_slice(&[1; 8192])
+        .unwrap();
+    rig.steps(10);
+    assert!(rig.connections[&rig.opened.id].receive_pending);
+    rig.connections
+        .get_mut(&rig.opened.id)
+        .unwrap()
+        .pending_send = Some(PendingSend::new(vec![2; 32]));
+    rig.steps(10);
+    assert!(rig.opened.send_result_rx.try_recv().unwrap().is_ok());
+    let mut bytes = [0; 32];
+    assert_eq!(
+        rig.sockets
+            .get_mut::<tcp::Socket>(rig.server)
+            .recv_slice(&mut bytes)
+            .unwrap(),
+        32
+    );
+    assert_eq!(bytes, [2; 32]);
+}
+
+#[test]
+fn receiver_acknowledges_only_on_next_read_and_cancels_on_early_drop() {
+    let (control_tx, control_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let mut receiver = TunnelTcpReceiver {
+        id: 1,
+        control_tx,
+        rx,
+        pending: false,
+        eof: false,
+    };
+    tx.send(vec![1]).unwrap();
+    assert_eq!(receiver.recv().unwrap(), [1]);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    tx.send(vec![2]).unwrap();
+    assert_eq!(receiver.recv().unwrap(), [2]);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(ControlMessage::Received { id: 1 })
+    ));
+    drop(receiver);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(ControlMessage::Abort { id: 1 })
+    ));
+}
+
+#[test]
+fn receiver_eof_preserves_the_upload_half() {
+    let (control_tx, control_rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
+    let mut receiver = TunnelTcpReceiver {
+        id: 1,
+        control_tx,
+        rx,
+        pending: false,
+        eof: false,
+    };
+    drop(tx);
+    assert!(receiver.recv().is_err());
+    drop(receiver);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+}
+
+#[test]
+fn a_stalled_reader_does_not_block_another_connection() {
+    let mut rig = Rig::new();
+    rig.establish();
+    rig.sockets
+        .get_mut::<tcp::Socket>(rig.server)
+        .send_slice(&[1; 8192])
+        .unwrap();
+    rig.steps(10);
+
+    let remote = Ipv4Address::new(192, 0, 2, 2);
+    let mut peer = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
+        tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
+    );
+    peer.listen((remote, 81)).unwrap();
+    let peer = rig.sockets.add(peer);
+    let opened = open_connection(
+        SocketAddrV4::new(remote, 81),
+        &mut rig.iface,
+        &mut rig.sockets,
+        &mut rig.connections,
+        &mut 2,
+        &mut 40001,
+    )
+    .unwrap();
+    rig.steps(10);
+    rig.sockets
+        .get_mut::<tcp::Socket>(peer)
+        .send_slice(b"independent")
+        .unwrap();
+    rig.steps(10);
+    assert_eq!(opened.uplink_rx.try_recv().unwrap(), b"independent");
+    assert!(rig.connections[&rig.opened.id].receive_pending);
 }

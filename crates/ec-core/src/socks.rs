@@ -441,7 +441,7 @@ fn relay_client_to_tunnel(
 
 fn relay_tunnel_to_client(
     client: &mut TcpStream,
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    mut rx: crate::netstack::TunnelTcpReceiver,
 ) -> EcResult<()> {
     while let Ok(chunk) = rx.recv() {
         if chunk.is_empty() {
