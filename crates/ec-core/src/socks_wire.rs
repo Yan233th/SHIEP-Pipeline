@@ -69,7 +69,13 @@ pub(crate) fn read_socks_request(client: &mut TcpStream) -> EcResult<SocksReques
         return Err(EcError::Runtime("invalid socks reserved byte".to_string()));
     }
 
-    let target = read_request_target(client, req[3])?;
+    let target = read_request_target(client, req[3]).inspect_err(|_| {
+        let rep = match req[3] {
+            SOCKS_ATYP_IPV4 | SOCKS_ATYP_DOMAIN | SOCKS_ATYP_IPV6 => SOCKS_REP_GENERAL_FAILURE,
+            _ => SOCKS_REP_ATYP_NOT_SUPPORTED,
+        };
+        let _ = write_reply(client, rep);
+    })?;
     Ok(SocksRequest { command, target })
 }
 
@@ -80,7 +86,7 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
             client
                 .read_exact(&mut ip)
                 .map_err(|e| EcError::Runtime(format!("read ipv4 failed: {e}")))?;
-            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+            Ok(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
         }
         SOCKS_ATYP_DOMAIN => {
             let mut len = [0u8; 1];
@@ -92,17 +98,16 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
                 .read_exact(&mut domain)
                 .map_err(|e| EcError::Runtime(format!("read domain failed: {e}")))?;
             String::from_utf8(domain)
-                .map_err(|e| EcError::Runtime(format!("invalid domain utf8: {e}")))?
+                .map_err(|_| EcError::Runtime("invalid socks domain: expected UTF-8".to_string()))
         }
         SOCKS_ATYP_IPV6 => {
             let mut ip = [0u8; 16];
             client
                 .read_exact(&mut ip)
                 .map_err(|e| EcError::Runtime(format!("read ipv6 failed: {e}")))?;
-            Ipv6Addr::from(ip).to_string()
+            Ok(Ipv6Addr::from(ip).to_string())
         }
         atyp => {
-            let _ = write_reply(client, SOCKS_REP_ATYP_NOT_SUPPORTED);
             return Err(EcError::Runtime(format!(
                 "unsupported socks atyp: 0x{atyp:02x}"
             )));
@@ -114,6 +119,20 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
         .read_exact(&mut port_buf)
         .map_err(|e| EcError::Runtime(format!("read target port failed: {e}")))?;
     let port = u16::from_be_bytes(port_buf);
+    let host = host?;
+    // A domain is reused in route logs and HTTP CONNECT authority fields.
+    if atyp == SOCKS_ATYP_DOMAIN
+        && (host.is_empty()
+            || host.chars().any(|c| {
+                c.is_control()
+                    || c.is_whitespace()
+                    || matches!(c, ':' | '/' | '\\' | '?' | '#' | '@' | '[' | ']' | '%')
+            }))
+    {
+        return Err(EcError::Runtime(
+            "invalid socks domain: empty name or forbidden character".to_string(),
+        ));
+    }
     Ok(ConnectTarget { host, port })
 }
 
@@ -200,7 +219,129 @@ impl std::fmt::Display for ConnectTarget {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectTarget, SocksCommand, format_socket_target};
+    use super::{
+        ConnectTarget, SocksCommand, SocksRequest, format_socket_target, read_socks_request,
+    };
+    use crate::error::{EcResult, concise_error};
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn parse_request(request: &[u8]) -> (EcResult<SocksRequest>, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(request).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let result = read_socks_request(&mut server);
+        drop(server);
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).unwrap();
+        (result, reply)
+    }
+
+    fn domain_request(domain: &[u8]) -> Vec<u8> {
+        let mut request = vec![5, 1, 0, 3, u8::try_from(domain.len()).unwrap()];
+        request.extend_from_slice(domain);
+        request.extend_from_slice(&443u16.to_be_bytes());
+        request
+    }
+
+    #[test]
+    fn malformed_domains_are_rejected_before_routing() {
+        for domain in [
+            b"good.test\r\nX-Injected: yes".as_slice(),
+            b"",
+            b"good.test\x1b[31m",
+            b"good.test\0hidden",
+            b" good.test",
+            b"good.test\t",
+            b"good.test\x7f",
+            b"good.test/path",
+            b"user@good.test",
+            b"good.test:80",
+            b"good.test?query",
+            b"good.test#fragment",
+            b"good.test\\path",
+            b"[::1]",
+            b"good.test%0d%0a",
+            "good.test\u{0085}".as_bytes(),
+            "good.test\u{00a0}".as_bytes(),
+            &[0xff],
+        ] {
+            let (result, reply) = parse_request(&domain_request(domain));
+            let Err(error) = result else {
+                panic!("malformed domain accepted: {domain:?}");
+            };
+            let error = concise_error(error);
+            assert!(error.starts_with("invalid socks domain"), "{error}");
+            assert!(!error.chars().any(char::is_control), "{error:?}");
+            assert_eq!(reply, [5, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn valid_domain_spelling_is_preserved() {
+        for domain in [
+            "MiXeD.example.",
+            "xn--bcher-kva.example",
+            "under_score.test",
+            "localhost",
+            "127.0.0.1",
+            "b\u{00fc}cher.example",
+        ] {
+            let (result, reply) = parse_request(&domain_request(domain.as_bytes()));
+            let request = result.unwrap();
+            assert_eq!(request.command, SocksCommand::Connect);
+            assert_eq!(request.target.host(), domain);
+            assert_eq!(request.target.port(), 443);
+            assert!(reply.is_empty());
+        }
+    }
+
+    #[test]
+    fn binary_ip_targets_keep_their_address_family() {
+        for (atyp, address, expected) in [
+            (1, vec![192, 0, 2, 1], "192.0.2.1:443"),
+            (
+                4,
+                "2001:db8::1"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets()
+                    .to_vec(),
+                "[2001:db8::1]:443",
+            ),
+        ] {
+            let mut packet = vec![5, 1, 0, atyp];
+            packet.extend_from_slice(&address);
+            packet.extend_from_slice(&443u16.to_be_bytes());
+            let (result, reply) = parse_request(&packet);
+            assert_eq!(result.unwrap().target.to_string(), expected);
+            assert!(reply.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_targets_send_one_failure_reply() {
+        for (request, code) in [
+            (vec![5, 1, 0, 0xff], 8),
+            (vec![5, 1, 0, 1, 192, 0], 1),
+            (vec![5, 1, 0, 3, 8, b'a'], 1),
+            (vec![5, 1, 0, 4, 0], 1),
+            (vec![5, 1, 0, 1, 192, 0, 2, 1, 0], 1),
+        ] {
+            let (result, reply) = parse_request(&request);
+            assert!(result.is_err());
+            assert_eq!(reply, [5, code, 0, 1, 0, 0, 0, 0, 0, 0]);
+        }
+    }
 
     #[test]
     fn socks_command_maps_known_values() {

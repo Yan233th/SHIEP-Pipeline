@@ -783,6 +783,33 @@ mod tests {
     }
 
     #[test]
+    fn invalid_domain_is_rejected_before_connecting_to_http_fallback() {
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", proxy_listener.local_addr().unwrap());
+        let proxy = parse_fallback_proxy(Some(&url)).unwrap().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle_client(stream, Some(&proxy))
+        });
+        assert_connect_failure_reply(request_test_socks_client(
+            addr,
+            "good.test\r\nX-Injected: yes",
+            443,
+        ));
+        let Err(ClientFailure::Request(error)) = server.join().unwrap() else {
+            panic!("expected request rejection before route selection");
+        };
+        assert!(crate::error::concise_error(error).starts_with("invalid socks domain"));
+        proxy_listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            proxy_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn refused_direct_connection_sends_failure_reply_before_closing() {
         install_empty_test_router();
         let refused =
