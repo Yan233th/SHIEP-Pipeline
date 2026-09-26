@@ -155,7 +155,7 @@ struct OpenedTcpConnection {
 
 struct ConnectionState {
     handle: SocketHandle,
-    uplink: mpsc::Sender<Vec<u8>>,
+    uplink: Option<mpsc::Sender<Vec<u8>>>,
     send_result: mpsc::Sender<EcResult<()>>,
     pending_send: Option<PendingSend>,
     close_requested: bool,
@@ -349,7 +349,7 @@ fn open_connection(
                 id,
                 ConnectionState {
                     handle,
-                    uplink: uplink_tx,
+                    uplink: Some(uplink_tx),
                     send_result: send_result_tx,
                     pending_send: None,
                     close_requested: false,
@@ -445,18 +445,30 @@ fn fail_pending_send(conn: &mut ConnectionState, err: EcError) {
 }
 
 fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
+    let Some(uplink) = conn.uplink.as_ref() else {
+        return;
+    };
     while socket.can_recv() {
         let mut buf = [0u8; 4096];
         match socket.recv_slice(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if conn.uplink.send(buf[..n].to_vec()).is_err() {
+                if uplink.send(buf[..n].to_vec()).is_err() {
                     conn.close_requested = true;
                     break;
                 }
             }
             Err(_) => break,
         }
+    }
+    // EOF belongs to the receive half; the peer may still be waiting for our data.
+    if !socket.may_recv()
+        && !matches!(
+            socket.state(),
+            tcp::State::SynSent | tcp::State::SynReceived
+        )
+    {
+        conn.uplink = None;
     }
 }
 
@@ -488,6 +500,9 @@ fn netstack_random_seed() -> u64 {
 fn smol_now(start: Instant) -> SmolInstant {
     SmolInstant::from_millis(start.elapsed().as_millis() as i64)
 }
+
+#[cfg(test)]
+mod tcp_tests;
 
 #[cfg(test)]
 mod tests {
