@@ -72,12 +72,21 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
         })
         .map_err(|e| EcError::Runtime(format!("send open connection request failed: {e}")))?;
 
-    match reply_rx.recv_timeout(OPEN_CONN_TIMEOUT) {
+    match reply_rx.recv() {
         Ok(Ok(opened)) => Ok(TunnelTcpConnection {
-            id: opened.id,
-            control_tx: control,
-            rx: opened.uplink_rx,
-            send_result_rx: opened.send_result_rx,
+            sender: TunnelTcpSender {
+                id: opened.id,
+                control_tx: control.clone(),
+                send_result_rx: opened.send_result_rx,
+                closed: false,
+            },
+            receiver: TunnelTcpReceiver {
+                id: opened.id,
+                control_tx: control,
+                rx: opened.uplink_rx,
+                pending: false,
+                eof: false,
+            },
         }),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(EcError::Runtime(format!(
@@ -88,28 +97,13 @@ pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
 
 #[derive(Debug)]
 pub struct TunnelTcpConnection {
-    id: u64,
-    control_tx: mpsc::Sender<ControlMessage>,
-    rx: mpsc::Receiver<Vec<u8>>,
-    send_result_rx: mpsc::Receiver<EcResult<()>>,
+    sender: TunnelTcpSender,
+    receiver: TunnelTcpReceiver,
 }
 
 impl TunnelTcpConnection {
     pub fn into_parts(self) -> (TunnelTcpSender, TunnelTcpReceiver) {
-        (
-            TunnelTcpSender {
-                id: self.id,
-                control_tx: self.control_tx.clone(),
-                send_result_rx: self.send_result_rx,
-            },
-            TunnelTcpReceiver {
-                id: self.id,
-                control_tx: self.control_tx,
-                rx: self.rx,
-                pending: false,
-                eof: false,
-            },
-        )
+        (self.sender, self.receiver)
     }
 }
 
@@ -118,6 +112,7 @@ pub struct TunnelTcpSender {
     id: u64,
     control_tx: mpsc::Sender<ControlMessage>,
     send_result_rx: mpsc::Receiver<EcResult<()>>,
+    closed: bool,
 }
 
 impl TunnelTcpSender {
@@ -130,10 +125,19 @@ impl TunnelTcpSender {
             .map_err(|e| EcError::Runtime(format!("wait tcp payload admission failed: {e}")))?
     }
 
-    pub fn close(&self) -> EcResult<()> {
+    pub fn close(mut self) -> EcResult<()> {
+        self.closed = true;
         self.control_tx
             .send(ControlMessage::Close { id: self.id })
             .map_err(|e| EcError::Runtime(format!("send tcp close request failed: {e}")))
+    }
+}
+
+impl Drop for TunnelTcpSender {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.control_tx.send(ControlMessage::Abort { id: self.id });
+        }
     }
 }
 
@@ -213,6 +217,13 @@ struct ConnectionState {
     receive_pending: bool,
     aborted: bool,
     close_requested: bool,
+    opening: Option<PendingOpen>,
+}
+
+struct PendingOpen {
+    reply: mpsc::Sender<EcResult<OpenedTcpConnection>>,
+    opened: OpenedTcpConnection,
+    deadline: SmolInstant,
 }
 
 struct PendingSend {
@@ -245,6 +256,7 @@ struct ControlDispatch<'a, 'b> {
     connections: &'a mut HashMap<u64, ConnectionState>,
     next_conn_id: &'a mut u64,
     next_local_port: &'a mut u16,
+    now: SmolInstant,
 }
 
 fn run_netstack_loop(
@@ -273,9 +285,10 @@ fn run_netstack_loop(
 
     loop {
         let now = smol_now(start);
-        let wait = iface
+        let tcp_wait = iface
             .poll_delay(now, &sockets)
             .map(|delay| Duration::from_millis(delay.total_millis()));
+        let wait = connection_wait(tcp_wait, &connections, now);
         if let Some(msg) = wait_control_message(&control_rx, wait)? {
             let mut dispatch = ControlDispatch {
                 device: &mut device,
@@ -284,13 +297,14 @@ fn run_netstack_loop(
                 connections: &mut connections,
                 next_conn_id: &mut next_conn_id,
                 next_local_port: &mut next_local_port,
+                now: smol_now(start),
             };
             process_control_batch(msg, &control_rx, &mut dispatch)?;
         }
 
         let now = smol_now(start);
         let _ = iface.poll(now, &mut device, &mut sockets);
-        drive_connections(&mut sockets, &mut connections);
+        drive_connections(&mut sockets, &mut connections, now);
     }
 }
 
@@ -327,7 +341,22 @@ fn handle_control_message(msg: ControlMessage, dispatch: &mut ControlDispatch<'_
                 dispatch.next_conn_id,
                 dispatch.next_local_port,
             );
-            let _ = reply.send(result);
+            match result {
+                Ok(opened) => {
+                    let conn = dispatch.connections.get_mut(&opened.id).unwrap();
+                    conn.opening = Some(PendingOpen {
+                        reply,
+                        opened,
+                        deadline: dispatch.now
+                            + smoltcp::time::Duration::from_millis(
+                                OPEN_CONN_TIMEOUT.as_millis() as u64
+                            ),
+                    });
+                }
+                Err(err) => {
+                    let _ = reply.send(Err(err));
+                }
+            }
         }
         ControlMessage::Send { id, data } => {
             if let Some(conn) = dispatch.connections.get_mut(&id) {
@@ -420,6 +449,7 @@ fn open_connection(
                     receive_pending: false,
                     aborted: false,
                     close_requested: false,
+                    opening: None,
                 },
             );
             Ok(OpenedTcpConnection {
@@ -435,7 +465,30 @@ fn open_connection(
     }
 }
 
-fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64, ConnectionState>) {
+fn connection_wait(
+    tcp_wait: Option<Duration>,
+    connections: &HashMap<u64, ConnectionState>,
+    now: SmolInstant,
+) -> Option<Duration> {
+    connections
+        .values()
+        .filter_map(|conn| conn.opening.as_ref())
+        .map(|pending| {
+            if now >= pending.deadline {
+                Duration::ZERO
+            } else {
+                Duration::from_millis((pending.deadline - now).total_millis())
+            }
+        })
+        .chain(tcp_wait)
+        .min()
+}
+
+fn drive_connections(
+    sockets: &mut SocketSet<'_>,
+    connections: &mut HashMap<u64, ConnectionState>,
+    now: SmolInstant,
+) {
     let mut remove_ids = Vec::new();
     for (id, conn) in connections.iter_mut() {
         let socket = sockets.get_mut::<tcp::Socket>(conn.handle);
@@ -446,13 +499,44 @@ fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64,
             continue;
         }
 
+        if let Some(pending) = conn.opening.as_ref() {
+            let error = if conn.close_requested {
+                Some("tcp connect cancelled")
+            } else if now >= pending.deadline {
+                Some("tcp connect timed out after 10s")
+            } else if !socket.is_open() {
+                Some("tcp connection refused or reset during handshake")
+            } else {
+                None
+            };
+            if let Some(message) = error {
+                let pending = conn.opening.take().unwrap();
+                let _ = pending
+                    .reply
+                    .send(Err(EcError::Runtime(message.to_string())));
+                socket.abort();
+                conn.aborted = true;
+                continue;
+            }
+            if socket.may_send() {
+                let pending = conn.opening.take().unwrap();
+                if pending.reply.send(Ok(pending.opened)).is_err() {
+                    socket.abort();
+                    conn.aborted = true;
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+
         pump_pending_sends(socket, conn);
         pump_uplink_reads(socket, conn);
 
-        if conn.close_requested && conn.pending_send.is_none() && socket.may_send() {
+        if conn.close_requested && conn.pending_send.is_none() {
             socket.close();
         }
-        if !socket.is_open() && !socket.can_recv() && !conn.aborted {
+        if !socket.is_open() {
             if conn.pending_send.is_some() {
                 fail_pending_send(
                     conn,
@@ -461,7 +545,9 @@ fn drive_connections(sockets: &mut SocketSet<'_>, connections: &mut HashMap<u64,
                     ),
                 );
             }
-            remove_ids.push(*id);
+            if !socket.can_recv() && !conn.aborted {
+                remove_ids.push(*id);
+            }
         }
     }
 
@@ -603,6 +689,7 @@ mod tests {
                 id: TEST_CONN_ID,
                 control_tx,
                 send_result_rx,
+                closed: false,
             },
             control_rx,
             send_result_tx,
