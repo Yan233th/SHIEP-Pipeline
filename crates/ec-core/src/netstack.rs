@@ -2,7 +2,7 @@ use crate::error::{EcError, EcResult};
 use crate::netstack_device::TunnelDevice;
 use crate::output::{self, Scope};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use std::collections::HashMap;
@@ -17,6 +17,9 @@ const OPEN_CONN_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_BUFFER_CAPACITY: usize = 64 * 1024;
 const RECEIVE_CHUNK_SIZE: usize = 4096;
 const MAX_CONTROL_BATCH: usize = 64;
+const LOCAL_PORT_START: u16 = 40000;
+const LOCAL_PORT_END: u16 = 60000;
+const LOCAL_PORT_COUNT: usize = (LOCAL_PORT_END - LOCAL_PORT_START) as usize + 1;
 const NETSTACK_CONTROL_DISCONNECTED: &str = "netstack control channel disconnected";
 
 pub fn validate_netstack_preconditions() -> EcResult<()> {
@@ -222,6 +225,7 @@ struct ConnectionState {
     receive_pending: bool,
     remote_fin: bool,
     receive_eof: bool,
+    relay_closed: bool,
     aborted: bool,
     close_requested: bool,
     opening: Option<PendingOpen>,
@@ -287,7 +291,7 @@ fn run_netstack_loop(
     let mut sockets = SocketSet::new(vec![]);
     let mut connections = HashMap::<u64, ConnectionState>::new();
     let mut next_conn_id: u64 = 1;
-    let mut next_local_port: u16 = 40000;
+    let mut next_local_port = LOCAL_PORT_START;
     let start = Instant::now();
 
     loop {
@@ -425,12 +429,19 @@ fn open_connection(
     next_conn_id: &mut u64,
     next_local_port: &mut u16,
 ) -> EcResult<OpenedTcpConnection> {
+    let local_port = alloc_local_port(
+        next_local_port,
+        sockets.iter().filter_map(|(_, socket)| {
+            tcp::Socket::downcast(socket)
+                .and_then(tcp::Socket::local_endpoint)
+                .map(|endpoint| endpoint.port)
+        }),
+    )?;
     let socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
         tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER_CAPACITY]),
     );
     let handle = sockets.add(socket);
-    let local_port = alloc_local_port(next_local_port);
     let connect_result = {
         let socket = sockets.get_mut::<tcp::Socket>(handle);
         socket.connect(
@@ -456,6 +467,7 @@ fn open_connection(
                     receive_pending: false,
                     remote_fin: false,
                     receive_eof: false,
+                    relay_closed: false,
                     aborted: false,
                     close_requested: false,
                     opening: None,
@@ -516,6 +528,14 @@ fn drive_connections(
                 fail_pending_send(conn, EcError::Runtime("tcp connection aborted".to_string()));
             }
             remove_ids.push(*id);
+            continue;
+        }
+
+        // Relay completion must not discard smoltcp's TIME_WAIT state and timer.
+        if conn.relay_closed {
+            if socket.state() == tcp::State::Closed {
+                remove_ids.push(*id);
+            }
             continue;
         }
 
@@ -582,7 +602,10 @@ fn drive_connections(
             }
             if !socket.can_recv() && !conn.aborted {
                 let _ = conn.uplink.send(Ok(TunnelTcpRead::Closed));
-                remove_ids.push(*id);
+                conn.relay_closed = true;
+                if socket.state() == tcp::State::Closed {
+                    remove_ids.push(*id);
+                }
             }
         }
     }
@@ -693,10 +716,30 @@ fn resolve_ipv4_target(target: &str) -> EcResult<SocketAddrV4> {
         .ok_or_else(|| EcError::Runtime(format!("no ipv4 address resolved for {target}")))
 }
 
-fn alloc_local_port(next: &mut u16) -> u16 {
-    let port = *next;
-    *next = if *next >= 60000 { 40000 } else { *next + 1 };
-    port
+fn alloc_local_port(next: &mut u16, occupied: impl Iterator<Item = u16>) -> EcResult<u16> {
+    // Derive occupancy from live sockets, including TIME_WAIT, without a second registry.
+    let mut used = [0u64; LOCAL_PORT_COUNT.div_ceil(64)];
+    for port in occupied {
+        if (LOCAL_PORT_START..=LOCAL_PORT_END).contains(&port) {
+            let index = usize::from(port - LOCAL_PORT_START);
+            used[index / 64] |= 1 << (index % 64);
+        }
+    }
+    for _ in 0..LOCAL_PORT_COUNT {
+        let port = *next;
+        *next = if port == LOCAL_PORT_END {
+            LOCAL_PORT_START
+        } else {
+            port + 1
+        };
+        let index = usize::from(port - LOCAL_PORT_START);
+        if used[index / 64] & (1 << (index % 64)) == 0 {
+            return Ok(port);
+        }
+    }
+    Err(EcError::Runtime(
+        "tcp local port range exhausted".to_string(),
+    ))
 }
 
 fn netstack_random_seed() -> u64 {
@@ -716,7 +759,8 @@ mod tcp_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlMessage, PendingSend, TunnelTcpSender, alloc_local_port, netstack_random_seed,
+        ControlMessage, LOCAL_PORT_END, LOCAL_PORT_START, PendingSend, TunnelTcpSender,
+        alloc_local_port, netstack_random_seed,
     };
     use crate::error::{EcError, EcResult, concise_error};
     use std::sync::mpsc;
@@ -757,10 +801,35 @@ mod tests {
     #[test]
     fn alloc_local_port_wraps_after_60000() {
         let mut next = 60000;
-        let p1 = alloc_local_port(&mut next);
-        let p2 = alloc_local_port(&mut next);
+        let p1 = alloc_local_port(&mut next, std::iter::empty()).unwrap();
+        let p2 = alloc_local_port(&mut next, std::iter::empty()).unwrap();
         assert_eq!(p1, 60000);
         assert_eq!(p2, 40000);
+    }
+
+    #[test]
+    fn local_port_allocation_skips_occupied_ports_across_wrap() {
+        let mut next = LOCAL_PORT_END;
+        let occupied = [LOCAL_PORT_END, LOCAL_PORT_START, LOCAL_PORT_START, 80];
+        assert_eq!(
+            alloc_local_port(&mut next, occupied.into_iter()).unwrap(),
+            LOCAL_PORT_START + 1
+        );
+        assert_eq!(next, LOCAL_PORT_START + 2);
+    }
+
+    #[test]
+    fn local_port_exhaustion_is_bounded_and_recovers_after_release() {
+        let mut next = LOCAL_PORT_START + 17;
+        let error = alloc_local_port(&mut next, LOCAL_PORT_START..=LOCAL_PORT_END).unwrap_err();
+        assert!(concise_error(error).contains("local port range exhausted"));
+        assert_eq!(next, LOCAL_PORT_START + 17);
+        let occupied = (LOCAL_PORT_START..=LOCAL_PORT_END).filter(|port| *port != LOCAL_PORT_END);
+        assert_eq!(
+            alloc_local_port(&mut next, occupied).unwrap(),
+            LOCAL_PORT_END
+        );
+        assert_eq!(next, LOCAL_PORT_START);
     }
 
     #[test]

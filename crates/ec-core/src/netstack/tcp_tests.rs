@@ -314,7 +314,225 @@ fn complete_close_still_delivers_buffered_response_before_eof() {
     }
     assert_eq!(received, [9; 8192]);
     assert!(closed);
+    assert!(rig.connections[&1].relay_closed);
+    assert_eq!(rig.client().state(), tcp::State::TimeWait);
+    let deadline = rig
+        .iface
+        .poll_at(SmolInstant::from_millis(rig.clock), &rig.sockets)
+        .unwrap();
+    assert!(deadline.total_millis() > rig.clock);
+    rig.clock = deadline.total_millis();
+    rig.steps(1);
     assert!(rig.connections.is_empty());
+}
+
+#[test]
+fn port_wrap_preserves_live_connections_to_the_same_target() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let old = rig.client().local_endpoint().unwrap();
+    let remote = rig.client().remote_endpoint().unwrap();
+    let mut next = LOCAL_PORT_END;
+    assert_eq!(
+        alloc_local_port(&mut next, std::iter::empty()).unwrap(),
+        LOCAL_PORT_END
+    );
+    assert_eq!(next, old.port);
+    let mut peer = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 4096]),
+        tcp::SocketBuffer::new(vec![0; 4096]),
+    );
+    peer.listen(remote).unwrap();
+    rig.sockets.add(peer);
+    let second = open_connection(
+        SocketAddrV4::new(Ipv4Address::new(192, 0, 2, 2), 80),
+        &mut rig.iface,
+        &mut rig.sockets,
+        &mut rig.connections,
+        &mut 2,
+        &mut next,
+    )
+    .unwrap();
+    rig.steps(10);
+    let socket = rig
+        .sockets
+        .get::<tcp::Socket>(rig.connections[&second.id].handle);
+    assert_ne!(socket.local_endpoint(), Some(old));
+    assert_eq!(socket.remote_endpoint(), Some(remote));
+    assert_eq!(socket.state(), tcp::State::Established);
+    assert_eq!(rig.client().state(), tcp::State::Established);
+}
+
+#[test]
+fn time_wait_reserves_the_port_until_native_timer_expiry() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let port = rig.client().local_endpoint().unwrap().port;
+    rig.control(ControlMessage::Close { id: 1 });
+    rig.sockets.get_mut::<tcp::Socket>(rig.server).close();
+    rig.steps(10);
+    assert!(rig.connections[&1].relay_closed);
+    assert_eq!(rig.client().state(), tcp::State::TimeWait);
+    let events: Vec<_> = rig
+        .opened
+        .as_ref()
+        .unwrap()
+        .uplink_rx
+        .try_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(events, [TunnelTcpRead::Eof, TunnelTcpRead::Closed]);
+
+    let now = SmolInstant::from_millis(rig.clock);
+    let wait = connection_wait(
+        rig.iface
+            .poll_delay(now, &rig.sockets)
+            .map(|delay| Duration::from_millis(delay.total_millis())),
+        &rig.connections,
+        now,
+    )
+    .unwrap();
+    assert!(!wait.is_zero());
+    let mut next = port;
+    let second = open_connection(
+        SocketAddrV4::new(Ipv4Address::new(192, 0, 2, 2), 81),
+        &mut rig.iface,
+        &mut rig.sockets,
+        &mut rig.connections,
+        &mut 2,
+        &mut next,
+    )
+    .unwrap();
+    let socket = rig
+        .sockets
+        .get::<tcp::Socket>(rig.connections[&second.id].handle);
+    assert_ne!(socket.local_endpoint().unwrap().port, port);
+    rig.control(ControlMessage::Abort { id: second.id });
+    assert!(!rig.connections.contains_key(&second.id));
+    assert!(matches!(
+        rig.opened.as_ref().unwrap().uplink_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+
+    rig.clock = now.total_millis() + wait.as_millis() as i64;
+    rig.steps(1);
+    assert!(rig.connections.is_empty());
+    assert_eq!(rig.sockets.iter().count(), 1);
+    assert_eq!(
+        rig.iface
+            .poll_delay(SmolInstant::from_millis(rig.clock), &rig.sockets),
+        None
+    );
+    next = port;
+    let third = open_connection(
+        SocketAddrV4::new(Ipv4Address::new(192, 0, 2, 2), 82),
+        &mut rig.iface,
+        &mut rig.sockets,
+        &mut rig.connections,
+        &mut 3,
+        &mut next,
+    )
+    .unwrap();
+    assert_eq!(
+        rig.sockets
+            .get::<tcp::Socket>(rig.connections[&third.id].handle)
+            .local_endpoint()
+            .unwrap()
+            .port,
+        port
+    );
+}
+
+#[test]
+fn repeated_fin_after_lost_final_ack_gets_ack_instead_of_reset() {
+    use smoltcp::phy::{Device, RxToken, TxToken};
+    use smoltcp::wire::{Ipv4Packet, TcpPacket};
+
+    let mut rig = Rig::new();
+    rig.establish();
+    rig.control(ControlMessage::Close { id: 1 });
+    assert_eq!(rig.client().state(), tcp::State::FinWait2);
+    rig.sockets.get_mut::<tcp::Socket>(rig.server).close();
+    let now = SmolInstant::from_millis(rig.clock);
+    rig.iface
+        .poll_egress(now, &mut rig.device, &mut rig.sockets);
+    let (rx, tx) = rig.device.receive(now).unwrap();
+    let fin = rx.consume(|packet| packet.to_vec());
+    assert!(
+        TcpPacket::new_checked(Ipv4Packet::new_checked(&fin).unwrap().payload())
+            .unwrap()
+            .fin()
+    );
+    tx.consume(fin.len(), |packet| packet.copy_from_slice(&fin));
+    rig.iface
+        .poll_ingress_single(now, &mut rig.device, &mut rig.sockets);
+    assert_eq!(rig.client().state(), tcp::State::TimeWait);
+    rig.iface
+        .poll_egress(now, &mut rig.device, &mut rig.sockets);
+    // Drop the final ACK so that the peer needs to repeat its FIN.
+    let (rx, _) = rig.device.receive(now).unwrap();
+    let ack = rx.consume(|packet| packet.to_vec());
+    assert!(
+        !TcpPacket::new_checked(Ipv4Packet::new_checked(&ack).unwrap().payload())
+            .unwrap()
+            .rst()
+    );
+    drive_connections(&mut rig.sockets, &mut rig.connections, now);
+    rig.device
+        .transmit(now)
+        .unwrap()
+        .consume(fin.len(), |packet| packet.copy_from_slice(&fin));
+    rig.iface
+        .poll_ingress_single(now, &mut rig.device, &mut rig.sockets);
+    rig.iface
+        .poll_egress(now, &mut rig.device, &mut rig.sockets);
+    let (rx, _) = rig.device.receive(now).unwrap();
+    let response = rx.consume(|packet| packet.to_vec());
+    let ip = Ipv4Packet::new_checked(&response).unwrap();
+    let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+    assert!(
+        !tcp.rst(),
+        "lost closing ACK converted a graceful close into a reset"
+    );
+    assert!(tcp.ack());
+}
+
+#[test]
+fn active_close_finishes_relay_before_time_wait_expires() {
+    let mut rig = Rig::new();
+    rig.establish();
+    let (conn, control_rx) = rig.tunnel_connection();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (relay_client, _) = listener.accept().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let relay = thread::spawn(move || {
+        let _ = done_tx.send(crate::socks::relay_tunnel(relay_client, conn));
+    });
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    let close = control_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(close, ControlMessage::Close { id: 1 }));
+    rig.control(close);
+    assert_eq!(rig.client().state(), tcp::State::FinWait2);
+    let peer = rig.sockets.get_mut::<tcp::Socket>(rig.server);
+    peer.send_slice(b"response after client FIN").unwrap();
+    peer.close();
+    rig.steps(10);
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    assert_eq!(response, b"response after client FIN");
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok()
+    );
+    relay.join().unwrap();
+    assert!(rig.connections[&1].relay_closed);
+    assert_eq!(rig.client().state(), tcp::State::TimeWait);
 }
 
 #[test]
@@ -797,9 +1015,18 @@ fn tunnel_upload_relay_forwards_short_writes_and_resumes_after_backpressure() {
             .unwrap()
             .is_ok()
     );
-    assert!(rig.connections.is_empty());
     writer.join().unwrap();
     relay.join().unwrap();
+    assert!(rig.connections[&1].relay_closed);
+    assert_eq!(rig.client().state(), tcp::State::TimeWait);
+    let deadline = rig
+        .iface
+        .poll_at(SmolInstant::from_millis(rig.clock), &rig.sockets)
+        .unwrap();
+    assert!(deadline.total_millis() > rig.clock);
+    rig.clock = deadline.total_millis();
+    rig.steps(1);
+    assert!(rig.connections.is_empty());
 }
 
 #[test]
