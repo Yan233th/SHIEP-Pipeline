@@ -71,8 +71,9 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
         ));
     }
 
-    let text = String::from_utf8_lossy(&raw);
-    let xml_payload = extract_xml_payload(&text)?;
+    let text = std::str::from_utf8(&raw)
+        .map_err(|e| EcError::Runtime(format!("rclist response is not valid UTF-8: {e}")))?;
+    let xml_payload = extract_xml_payload(text)?;
     parse_route_table_xml(xml_payload)
 }
 
@@ -91,19 +92,47 @@ fn parse_route_table_xml(xml: &str) -> EcResult<RouteTable> {
     let mut rules = Vec::<RouteRule>::new();
     let mut dns_servers = Vec::<String>::new();
     let mut dns_records = Vec::<DnsRecord>::new();
+    let mut depth = 0usize;
+    let mut resource_seen = false;
 
     loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => match e.name() {
-                QName(b"Rc") => parse_rc(e, &reader, &mut rules)?,
-                QName(b"Dns") => parse_dns(e, &reader, &mut dns_servers, &mut dns_records)?,
-                _ => {}
-            },
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(e) => return Err(EcError::Runtime(format!("rclist xml parse failed: {e}"))),
+        let event = reader
+            .read_event_into(&mut buf)
+            .map_err(|e| EcError::Runtime(format!("rclist xml parse failed: {e}")))?;
+        match &event {
+            Event::Start(e) | Event::Empty(e) => {
+                if depth == 0 {
+                    if resource_seen || e.name() != QName(b"Resource") {
+                        return Err(EcError::Runtime(
+                            "rclist XML must contain one Resource root".to_string(),
+                        ));
+                    }
+                    resource_seen = true;
+                }
+                match e.name() {
+                    QName(b"Rc") => parse_rc(e, &reader, &mut rules)?,
+                    QName(b"Dns") => parse_dns(e, &reader, &mut dns_servers, &mut dns_records)?,
+                    _ => {}
+                }
+                if matches!(event, Event::Start(_)) {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => depth -= 1,
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
+                return Err(EcError::Runtime(
+                    "rclist XML contains data outside Resource".to_string(),
+                ));
+            }
+            Event::Eof => break,
+            _ => {}
         }
         buf.clear();
+    }
+    if !resource_seen || depth != 0 {
+        return Err(EcError::Runtime(
+            "rclist XML is incomplete: Resource is missing or unclosed".to_string(),
+        ));
     }
 
     Ok(RouteTable {
@@ -220,13 +249,36 @@ fn is_timeout_or_wouldblock(err: &std::io::Error) -> bool {
 }
 
 fn extract_xml_payload(response_text: &str) -> EcResult<&str> {
-    let xml_start = response_text
+    let (headers, body) = response_text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| EcError::Runtime("rclist response headers are incomplete".to_string()))?;
+    let mut lines = headers.lines();
+    let status = lines.next().unwrap_or_default();
+    if status.split_whitespace().nth(1) != Some("200") {
+        return Err(EcError::Runtime(format!("rclist request failed: {status}")));
+    }
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            let expected = value.trim().parse::<usize>().map_err(|_| {
+                EcError::Runtime("rclist response has invalid Content-Length".to_string())
+            })?;
+            if body.len() != expected {
+                return Err(EcError::Runtime(format!(
+                    "rclist response length mismatch: expected {expected} bytes, got {}",
+                    body.len()
+                )));
+            }
+        }
+    }
+    let xml_start = body
         .find("<?xml")
-        .or_else(|| response_text.find("<Resource>"))
+        .or_else(|| body.find("<Resource"))
         .ok_or_else(|| {
             EcError::Runtime("rclist response does not contain XML payload".to_string())
         })?;
-    Ok(&response_text[xml_start..])
+    Ok(&body[xml_start..])
 }
 
 fn push_dns_servers(dns_servers: &mut Vec<String>, servers: &str) {
@@ -404,5 +456,56 @@ mod tests {
     fn extract_xml_payload_rejects_non_xml_text() {
         let err = extract_xml_payload("HTTP/1.1 200 OK\r\n\r\nhello").unwrap_err();
         assert!(err.to_string().contains("does not contain XML payload"));
+    }
+
+    #[test]
+    fn xml_rejects_every_truncated_prefix() {
+        let xml = r#"<?xml version="1.0"?><Resource><Rcs><Rc id="1" host="example.test" port="80"/></Rcs><Dns dnsserver="192.0.2.53"/></Resource>"#;
+        for (end, _) in xml.char_indices() {
+            assert!(
+                parse_route_table_xml(&xml[..end]).is_err(),
+                "accepted prefix ending at {end}"
+            );
+        }
+        let table = parse_route_table_xml(xml).unwrap();
+        assert_eq!(table.rules.len(), 1);
+        assert_eq!(table.dns_servers, ["192.0.2.53"]);
+    }
+
+    #[test]
+    fn xml_requires_one_complete_resource_document() {
+        for invalid in [
+            "<Resource><Rcs></Resource>",
+            "<Rcs/>",
+            "<Resource/><Resource/>",
+            "<Resource/>trailing",
+            "<Resource/><![CDATA[trailing]]>",
+            "</Resource>",
+        ] {
+            assert!(
+                parse_route_table_xml(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        assert!(parse_route_table_xml(" \n<Resource/>\n ").is_ok());
+        assert!(parse_route_table_xml("<!-- routes --><Resource></Resource><!-- end -->").is_ok());
+    }
+
+    #[test]
+    fn response_checks_http_status_and_declared_body_length() {
+        let xml = "<Resource/>";
+        let complete = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{xml}",
+            xml.len()
+        );
+        assert_eq!(extract_xml_payload(&complete).unwrap(), xml);
+        for invalid in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n<Resource/>",
+            "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n<Resource/>",
+            "HTTP/1.1 403 Forbidden\r\n\r\n<Resource/>",
+            "HTTP/1.1 200 OK\r\n",
+        ] {
+            assert!(extract_xml_payload(invalid).is_err());
+        }
     }
 }
