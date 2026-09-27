@@ -22,10 +22,6 @@ const LOCAL_PORT_END: u16 = 60000;
 const LOCAL_PORT_COUNT: usize = (LOCAL_PORT_END - LOCAL_PORT_START) as usize + 1;
 const NETSTACK_CONTROL_DISCONNECTED: &str = "netstack control channel disconnected";
 
-pub fn validate_netstack_preconditions() -> EcResult<()> {
-    Ok(())
-}
-
 pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
     if CONTROL_TX.get().is_some() {
         return Ok(());

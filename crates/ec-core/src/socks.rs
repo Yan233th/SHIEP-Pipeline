@@ -1,6 +1,6 @@
 use crate::error::{EcError, EcResult};
 use crate::output::{self, RouteKind, Scope};
-use crate::socks_proxy::{FallbackProxy, connect_via_proxy, parse_fallback_proxy};
+use crate::socks_proxy::{FallbackProxy, connect_via_proxy};
 use crate::socks_wire::{
     ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_GENERAL_FAILURE, SOCKS_REP_SUCCEEDED,
     SocksCommand, format_socket_target, negotiate_method, read_socks_request, write_reply,
@@ -12,13 +12,12 @@ use std::thread;
 const RELAY_BUFFER_SIZE: usize = 4096;
 const TUNNEL_UPLOAD_BUFFER_SIZE: usize = 8 * 1024;
 
-pub fn serve(bind_addr: &str, fallback_proxy: Option<&str>) -> EcResult<()> {
+pub(crate) fn serve(bind_addr: &str, fallback_proxy: Option<FallbackProxy>) -> EcResult<()> {
     let normalized = normalize_bind_addr(bind_addr);
-    let fallback_proxy = parse_fallback_proxy(fallback_proxy)?;
     let listener = TcpListener::bind(&normalized)
         .map_err(|e| EcError::Runtime(format!("socks bind failed on {bind_addr}: {e}")))?;
     log_socks_startup(normalized.as_str(), fallback_proxy.as_ref());
-    spawn_accept_loop(listener, fallback_proxy.clone());
+    spawn_accept_loop(listener, fallback_proxy);
 
     let _reason = crate::runtime_state::wait_fatal_reason();
     Err(EcError::Runtime("runtime closed".to_string()))

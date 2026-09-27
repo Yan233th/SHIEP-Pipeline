@@ -15,22 +15,14 @@ impl EasyConnectApp {
     }
 
     pub fn run(&self) -> EcResult<()> {
-        Self::validate_preconditions()?;
+        let fallback_proxy =
+            crate::socks_proxy::parse_fallback_proxy(self.config.fallback_proxy.as_deref())?;
         let twf_id = self.login()?;
         self.try_install_route_table(&twf_id)?;
         let token = self.acquire_protocol_token(&twf_id)?;
         let tunnel_ips = self.start_tunnel(&token)?;
         crate::netstack::start_runtime(tunnel_ips.assigned_ip)?;
-        crate::socks::serve(
-            &self.config.socks_bind,
-            self.config.fallback_proxy.as_deref(),
-        )
-    }
-
-    fn validate_preconditions() -> EcResult<()> {
-        crate::transport::validate_transport_preconditions()?;
-        crate::netstack::validate_netstack_preconditions()?;
-        Ok(())
+        crate::socks::serve(&self.config.socks_bind, fallback_proxy)
     }
 
     fn login(&self) -> EcResult<String> {
@@ -94,5 +86,28 @@ impl EasyConnectApp {
         crate::protocol::start_tunnel_runtime(&self.config.server, token, tunnel_ips)?;
         output::success(Scope::Protocol, "tunnel established");
         Ok(tunnel_ips)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EasyConnectApp;
+    use crate::{AppConfig, EcError};
+
+    #[test]
+    fn invalid_fallback_is_rejected_before_login() {
+        for fallback in ["https://127.0.0.1:8443", "socks5h://"] {
+            let config = AppConfig::new(
+                "http://127.0.0.1:0".to_string(),
+                "test".to_string(),
+                "test".to_string(),
+                "127.0.0.1:0".to_string(),
+                Some(fallback.to_string()),
+            )
+            .unwrap();
+            let error = EasyConnectApp::new(config).run().unwrap_err();
+            assert!(matches!(error, EcError::InvalidConfig(_)), "{error}");
+            assert!(error.to_string().contains("fallback is invalid"));
+        }
     }
 }

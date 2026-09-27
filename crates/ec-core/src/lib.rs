@@ -19,7 +19,6 @@ mod socks_proxy;
 mod socks_wire;
 mod tls;
 mod token;
-mod transport;
 
 pub use app::EasyConnectApp;
 pub use config::AppConfig;
