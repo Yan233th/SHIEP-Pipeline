@@ -1,11 +1,11 @@
 use crate::error::{EcError, EcResult};
 use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
+use rsa::rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,6 @@ const DNS_CACHE_CAPACITY: usize = 1024;
 const DNS_UDP_BUFFER_SIZE: usize = 4096;
 const DNS_TCP_MAX_PAYLOAD: usize = 65535;
 
-static DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 static DNS_CACHE: OnceLock<Mutex<HashMap<CacheKey, CacheEntry>>> = OnceLock::new();
 static DNS_LOOKUP_CACHE: OnceLock<Mutex<HashMap<String, LookupCacheEntry>>> = OnceLock::new();
 
@@ -199,7 +198,7 @@ fn query_server_message(host: &str, server: SocketAddr) -> EcResult<Message> {
 
 fn build_a_query(host: &str) -> EcResult<Message> {
     let mut message = Message::new();
-    let id = next_query_id();
+    let id = next_query_id()?;
     let fqdn = if host.ends_with('.') {
         host.to_string()
     } else {
@@ -396,8 +395,12 @@ fn bind_udp_socket(server: SocketAddr) -> EcResult<UdpSocket> {
     Ok(socket)
 }
 
-fn next_query_id() -> u16 {
-    DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed)
+fn next_query_id() -> EcResult<u16> {
+    let mut id = [0u8; 2];
+    OsRng
+        .try_fill_bytes(&mut id)
+        .map_err(|e| EcError::Runtime(format!("dns query id generation failed: {e}")))?;
+    Ok(u16::from_ne_bytes(id))
 }
 
 fn cache_get(key: &CacheKey) -> Option<Ipv4Addr> {
