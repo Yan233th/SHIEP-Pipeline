@@ -96,7 +96,14 @@ mod tests {
 
     #[test]
     fn invalid_fallback_is_rejected_before_login() {
-        for fallback in ["https://127.0.0.1:8443", "socks5h://"] {
+        for fallback in [
+            "https://127.0.0.1:8443",
+            "socks5h://",
+            "socks5h://127.0.0.1:114514",
+            "http://proxy.invalid",
+            "socks5h://user:secret@proxy.invalid:1080",
+            "http://proxy.invalid/path:8080",
+        ] {
             let config = AppConfig::new(
                 "http://127.0.0.1:0".to_string(),
                 "test".to_string(),

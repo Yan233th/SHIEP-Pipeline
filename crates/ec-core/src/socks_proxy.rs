@@ -59,29 +59,59 @@ pub(crate) fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<Fallbac
 }
 
 fn parse_fallback_proxy_value(raw: &str) -> EcResult<FallbackProxy> {
-    let raw = raw.trim();
-    let parsed = if let Some((scheme, rest)) = raw.split_once("://") {
-        let kind = parse_fallback_proxy_scheme(scheme)?;
-        FallbackProxy {
-            addr: rest.trim().to_string(),
-            url: raw.to_string(),
-            kind,
-        }
+    let (scheme, addr, kind) = if let Some((scheme, rest)) = raw.split_once("://") {
+        (scheme, rest.trim(), parse_fallback_proxy_scheme(scheme)?)
     } else {
-        FallbackProxy {
-            addr: raw.to_string(),
-            url: format!("{FALLBACK_SCHEME_SOCKS5H}://{raw}"),
-            kind: FallbackProxyKind::Socks5,
-        }
+        (FALLBACK_SCHEME_SOCKS5H, raw, FallbackProxyKind::Socks5)
     };
+    validate_proxy_addr(addr)?;
+    Ok(FallbackProxy {
+        addr: addr.to_string(),
+        url: format!("{scheme}://{addr}"),
+        kind,
+    })
+}
 
-    if parsed.addr.trim().is_empty() {
+fn validate_proxy_addr(addr: &str) -> EcResult<()> {
+    if addr.is_empty() {
         return Err(EcError::InvalidConfig(
             "fallback is invalid: empty proxy address",
         ));
     }
-
-    Ok(parsed)
+    if addr.contains('@') {
+        return Err(EcError::InvalidConfig(
+            "fallback is invalid: proxy authentication is not supported",
+        ));
+    }
+    if addr
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '/' | '\\' | '?' | '#'))
+    {
+        return Err(EcError::InvalidConfig(
+            "fallback is invalid: expected host:port with no path, query or fragment",
+        ));
+    }
+    let (host, port) = addr.rsplit_once(':').ok_or(EcError::InvalidConfig(
+        "fallback is invalid: proxy port is required",
+    ))?;
+    if !port.bytes().all(|b| b.is_ascii_digit()) || !matches!(port.parse::<u16>(), Ok(1..=u16::MAX))
+    {
+        return Err(EcError::InvalidConfig(
+            "fallback is invalid: proxy port must be between 1 and 65535",
+        ));
+    }
+    let valid_host = if let Some(ip) = host.strip_prefix('[') {
+        ip.strip_suffix(']')
+            .is_some_and(|ip| ip.parse::<Ipv6Addr>().is_ok())
+    } else {
+        !host.is_empty() && !host.contains([':', '[', ']'])
+    };
+    if !valid_host {
+        return Err(EcError::InvalidConfig(
+            "fallback is invalid: expected a hostname, IPv4 address or bracketed IPv6 address",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_fallback_proxy_scheme(scheme: &str) -> EcResult<FallbackProxyKind> {
@@ -431,16 +461,16 @@ mod tests {
 
     #[test]
     fn parse_fallback_proxy_accepts_socks5_scheme() {
-        let parsed = parse_fallback_proxy(Some("socks5://127.0.0.1:114514")).unwrap();
-        assert_eq!(parsed.unwrap().addr, "127.0.0.1:114514");
+        let parsed = parse_fallback_proxy(Some("socks5://127.0.0.1:1080")).unwrap();
+        assert_eq!(parsed.unwrap().addr, "127.0.0.1:1080");
     }
 
     #[test]
     fn parse_fallback_proxy_accepts_plain_host_port() {
-        let parsed = parse_fallback_proxy(Some("127.0.0.1:114514")).unwrap();
+        let parsed = parse_fallback_proxy(Some("127.0.0.1:1080")).unwrap();
         let proxy = parsed.unwrap();
-        assert_eq!(proxy.addr, "127.0.0.1:114514");
-        assert_eq!(proxy.url, "socks5h://127.0.0.1:114514");
+        assert_eq!(proxy.addr, "127.0.0.1:1080");
+        assert_eq!(proxy.url, "socks5h://127.0.0.1:1080");
     }
 
     #[test]
@@ -461,6 +491,68 @@ mod tests {
             err.to_string()
                 .contains("only socks5://, socks5h:// and http:// are supported")
         );
+    }
+
+    #[test]
+    fn parse_fallback_proxy_rejects_invalid_ports() {
+        for addr in [
+            "proxy.test",
+            "proxy.test:",
+            "proxy.test:0",
+            "proxy.test:114514",
+            "proxy.test:-1",
+            "proxy.test:+80",
+            "proxy.test:http",
+            "[::1]",
+            "[::1]:65536",
+        ] {
+            for prefix in ["", "socks5://", "socks5h://", "http://"] {
+                let raw = format!("{prefix}{addr}");
+                let Err(error) = parse_fallback_proxy(Some(&raw)) else {
+                    panic!("invalid proxy port accepted: {raw}");
+                };
+                assert!(matches!(error, crate::error::EcError::InvalidConfig(_)));
+                assert!(error.to_string().contains("port"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_fallback_proxy_rejects_invalid_authorities() {
+        for addr in [
+            ":1080",
+            "proxy.test:1080/path",
+            "proxy.test/path:1080",
+            "proxy.test?query:1080",
+            "proxy.test#fragment:1080",
+            "proxy.test\\path:1080",
+            "user:secret@proxy.test:1080",
+            "proxy.test\r\n:1080",
+            "proxy test:1080",
+            "::1:1080",
+            "[::1:1080",
+            "[::1]extra:1080",
+            "[proxy.test]:1080",
+        ] {
+            let raw = format!("socks5h://{addr}");
+            let Err(error) = parse_fallback_proxy(Some(&raw)) else {
+                panic!("invalid proxy authority accepted: {raw:?}");
+            };
+            assert!(matches!(error, crate::error::EcError::InvalidConfig(_)));
+            assert!(!error.to_string().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn parse_fallback_proxy_accepts_hostnames_and_bracketed_ipv6_without_resolution() {
+        for addr in ["proxy.invalid:1", "localhost:65535", "[2001:db8::1]:1080"] {
+            for prefix in ["socks5://", "socks5h://", "http://"] {
+                let url = format!("{prefix}{addr}");
+                let proxy = parse_fallback_proxy(Some(&url)).unwrap().unwrap();
+                assert_eq!(proxy.addr, addr);
+                assert_eq!(proxy.url, url);
+            }
+        }
     }
 
     #[test]
