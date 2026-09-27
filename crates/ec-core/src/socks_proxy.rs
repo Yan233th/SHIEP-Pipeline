@@ -21,7 +21,6 @@ const FALLBACK_SCHEME_HTTP: &str = "http";
 const FALLBACK_SCHEME_ERROR: &str =
     "fallback is invalid: only socks5://, socks5h:// and http:// are supported";
 
-#[derive(Clone)]
 pub(crate) struct FallbackProxy {
     pub(crate) url: String,
     addr: String,

@@ -7,6 +7,7 @@ use crate::socks_wire::{
 };
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread;
 
 const RELAY_BUFFER_SIZE: usize = 4096;
@@ -47,6 +48,7 @@ fn log_socks_startup(bind_addr: &str, fallback_proxy: Option<&FallbackProxy>) {
 }
 
 fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy>) {
+    let fallback_proxy = fallback_proxy.map(Arc::new);
     thread::spawn(move || {
         loop {
             let (stream, _peer) = match listener.accept() {
@@ -61,7 +63,7 @@ fn spawn_accept_loop(listener: TcpListener, fallback_proxy: Option<FallbackProxy
             };
             let fallback_proxy = fallback_proxy.clone();
             thread::spawn(move || {
-                if let Err(failure) = handle_client(stream, fallback_proxy.as_ref()) {
+                if let Err(failure) = handle_client(stream, fallback_proxy.as_deref()) {
                     let (scope, err) = failure.into_log_parts();
                     output::error(scope, crate::error::concise_error(err));
                 }
@@ -120,7 +122,10 @@ fn reject_udp_associate(client: &mut TcpStream) -> EcResult<()> {
     Ok(())
 }
 
-fn decide_route(target: &ConnectTarget, fallback_proxy: Option<&FallbackProxy>) -> RouteDecision {
+fn decide_route<'a>(
+    target: &ConnectTarget,
+    fallback_proxy: Option<&'a FallbackProxy>,
+) -> RouteDecision<'a> {
     let target_display = target.to_string();
     let target_is_ip = is_ip_host(target.host());
     match crate::routing::plan_target(target.host(), target.port()) {
@@ -211,7 +216,7 @@ fn route_decision_remote(
     rc_name: String,
     source: crate::routing::RouteSource,
     dns_lookup: Option<crate::dns_resolver::ResolveSource>,
-) -> RouteDecision {
+) -> RouteDecision<'static> {
     let arrow = output::weak(" -> ");
     let lparen = output::weak("(");
     let rparen = output::weak(")");
@@ -282,13 +287,13 @@ fn describe_route_source(
     }
 }
 
-fn route_decision_fallback(
+fn route_decision_fallback<'a>(
     target: ConnectTarget,
     target_display: &str,
     dial: String,
     reason: String,
-    fallback_proxy: Option<&FallbackProxy>,
-) -> RouteDecision {
+    fallback_proxy: Option<&'a FallbackProxy>,
+) -> RouteDecision<'a> {
     let arrow = output::weak(" -> ");
     if let Some(proxy) = fallback_proxy {
         return RouteDecision {
@@ -298,7 +303,7 @@ fn route_decision_fallback(
                 output::value(proxy.url.as_str()),
             ),
             path: format!("fallback -> {}; reason: {reason}", proxy.url),
-            transport: RouteTransport::Proxy(proxy.clone(), target),
+            transport: RouteTransport::Proxy(proxy, target),
         };
     }
 
@@ -313,7 +318,7 @@ fn route_decision_fallback(
     }
 }
 
-fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDecision {
+fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDecision<'static> {
     let arrow = output::weak(" -> ");
     let reason = crate::error::concise_error(err);
     RouteDecision {
@@ -329,7 +334,7 @@ fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDeci
 fn execute_route(
     mut client: TcpStream,
     target_display: &str,
-    route: RouteDecision,
+    route: RouteDecision<'_>,
 ) -> EcResult<()> {
     let RouteDecision {
         line: _,
@@ -352,7 +357,7 @@ fn execute_route(
             relay_direct_with_reply(client, conn, target_display, route_path)
         }
         RouteTransport::Proxy(proxy, target) => {
-            let conn = connect_via_proxy(&proxy, target.host(), target.port())
+            let conn = connect_via_proxy(proxy, target.host(), target.port())
                 .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
             relay_direct_with_reply(client, conn, target_display, route_path)
         }
@@ -540,17 +545,17 @@ fn is_expected_relay_io_error(err: &std::io::Error) -> bool {
     )
 }
 
-enum RouteTransport {
+enum RouteTransport<'a> {
     Tunnel(String),
     Direct(String),
-    Proxy(FallbackProxy, ConnectTarget),
+    Proxy(&'a FallbackProxy, ConnectTarget),
     Unsupported(String),
 }
 
-struct RouteDecision {
+struct RouteDecision<'a> {
     line: String,
     path: String,
-    transport: RouteTransport,
+    transport: RouteTransport<'a>,
 }
 
 enum ClientFailure {
