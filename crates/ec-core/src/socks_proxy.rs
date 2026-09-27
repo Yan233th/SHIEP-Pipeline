@@ -224,21 +224,39 @@ fn read_socks5_connect_reply(stream: &mut TcpStream) -> EcResult<()> {
 
 fn read_http_proxy_head(stream: &mut TcpStream) -> EcResult<String> {
     let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 256];
     loop {
-        let mut one = [0u8; 1];
+        let start = buf.len();
+        // Bound peeking by header capacity; consume only through the delimiter.
+        buf.reserve(1);
+        let remaining = (buf.capacity() - start)
+            .min(HTTP_PROXY_HEAD_MAX_SIZE - start)
+            .min(chunk.len());
         let n = stream
-            .read(&mut one)
+            .peek(&mut chunk[..remaining])
             .map_err(|e| proxy_read_error("http proxy connect reply", e))?;
         if n == 0 {
             return Err(EcError::Runtime(
-                "http proxy connect reply is empty".to_string(),
+                "http proxy connect reply header is incomplete".to_string(),
             ));
         }
-        buf.push(one[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
+        buf.extend_from_slice(&chunk[..n]);
+        let search_start = start.saturating_sub(3);
+        let end = buf[search_start..]
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .map(|offset| search_start + offset + 4);
+        let consume_end = end.unwrap_or(buf.len());
+        read_proxy_exact(
+            stream,
+            &mut buf[start..consume_end],
+            "http proxy connect reply",
+        )?;
+        if let Some(end) = end {
+            buf.truncate(end);
             break;
         }
-        if buf.len() > HTTP_PROXY_HEAD_MAX_SIZE {
+        if buf.len() == HTTP_PROXY_HEAD_MAX_SIZE {
             return Err(EcError::Runtime(
                 "http proxy connect reply header is too large".to_string(),
             ));
@@ -344,9 +362,9 @@ fn consume_socks5_addr_and_port(stream: &mut TcpStream, atyp: u8) -> EcResult<()
 #[cfg(test)]
 mod tests {
     use super::{
-        SOCKS_ATYP_IPV6, append_socks5_addr, build_http_connect_request,
+        HTTP_PROXY_HEAD_MAX_SIZE, SOCKS_ATYP_IPV6, append_socks5_addr, build_http_connect_request,
         connect_via_http_connect_proxy_with_timeout, connect_via_socks5_proxy_with_timeout,
-        ensure_http_connect_success, parse_fallback_proxy,
+        ensure_http_connect_success, parse_fallback_proxy, read_http_proxy_head,
     };
     use std::io::{Read, Write};
     use std::net::{Ipv6Addr, TcpListener, TcpStream};
@@ -531,6 +549,75 @@ mod tests {
             stream.read_to_end(&mut payload).unwrap();
             assert_eq!(payload, b"first payload");
             assert_eq!(stream.read_timeout().unwrap(), None);
+        }
+    }
+
+    fn padded_http_head(size: usize) -> String {
+        let prefix = "HTTP/1.1 200 Connected\r\nX-Padding: ";
+        format!("{prefix}{}\r\n\r\n", "a".repeat(size - prefix.len() - 4))
+    }
+
+    #[test]
+    fn http_head_reader_keeps_payload_across_chunk_boundaries() {
+        for size in [255, 256, 257, 258, 511, 512, 513, HTTP_PROXY_HEAD_MAX_SIZE] {
+            let head = padded_http_head(size);
+            let expected = head.clone();
+            let (addr, proxy) = spawn_test_proxy(move |mut stream| {
+                let mut response = head.into_bytes();
+                response.extend_from_slice(b"\x00\xfftunnel\r\n\r\n");
+                stream.write_all(&response).unwrap();
+            });
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert_eq!(read_http_proxy_head(&mut stream).unwrap(), expected);
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).unwrap();
+            assert_eq!(payload, b"\x00\xfftunnel\r\n\r\n");
+            proxy.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn http_head_reader_accepts_fragmented_input() {
+        let head = padded_http_head(513);
+        let expected = head.clone();
+        let (addr, proxy) = spawn_test_proxy(move |mut stream| {
+            stream.set_nodelay(true).unwrap();
+            for byte in head.bytes() {
+                stream.write_all(&[byte]).unwrap();
+            }
+            stream.write_all(b"first payload").unwrap();
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert_eq!(read_http_proxy_head(&mut stream).unwrap(), expected);
+        let mut payload = Vec::new();
+        stream.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"first payload");
+        proxy.join().unwrap();
+    }
+
+    #[test]
+    fn http_head_reader_rejects_incomplete_or_oversized_headers() {
+        for (response, expected) in [
+            (String::new(), "incomplete"),
+            ("HTTP/1.1 200 Connected\r\n".to_string(), "incomplete"),
+            (padded_http_head(HTTP_PROXY_HEAD_MAX_SIZE + 1), "too large"),
+        ] {
+            let (addr, proxy) = spawn_test_proxy(move |mut stream| {
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let error = read_http_proxy_head(&mut stream).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            proxy.join().unwrap();
         }
     }
 
