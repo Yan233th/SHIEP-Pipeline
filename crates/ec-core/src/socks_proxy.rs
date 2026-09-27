@@ -2,7 +2,7 @@ use crate::error::{EcError, EcResult};
 use crate::output;
 use crate::socks_wire::format_socket_target;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6, TcpStream};
 use std::time::Duration;
 
 const HTTP_PROXY_HEAD_MAX_SIZE: usize = 16 * 1024;
@@ -100,9 +100,8 @@ fn validate_proxy_addr(addr: &str) -> EcResult<()> {
             "fallback is invalid: proxy port must be between 1 and 65535",
         ));
     }
-    let valid_host = if let Some(ip) = host.strip_prefix('[') {
-        ip.strip_suffix(']')
-            .is_some_and(|ip| ip.parse::<Ipv6Addr>().is_ok())
+    let valid_host = if host.starts_with('[') {
+        addr.parse::<SocketAddrV6>().is_ok()
     } else {
         !host.is_empty() && !host.contains([':', '[', ']'])
     };
@@ -533,6 +532,7 @@ mod tests {
             "[::1:1080",
             "[::1]extra:1080",
             "[proxy.test]:1080",
+            "[fe80::1%4294967296]:1080",
         ] {
             let raw = format!("socks5h://{addr}");
             let Err(error) = parse_fallback_proxy(Some(&raw)) else {
@@ -545,7 +545,13 @@ mod tests {
 
     #[test]
     fn parse_fallback_proxy_accepts_hostnames_and_bracketed_ipv6_without_resolution() {
-        for addr in ["proxy.invalid:1", "localhost:65535", "[2001:db8::1]:1080"] {
+        for addr in [
+            "proxy.invalid:1",
+            "localhost:65535",
+            "[2001:db8::1]:1080",
+            "[fe80::1%1]:1080",
+            "[fe80::1%4294967295]:1080",
+        ] {
             for prefix in ["socks5://", "socks5h://", "http://"] {
                 let url = format!("{prefix}{addr}");
                 let proxy = parse_fallback_proxy(Some(&url)).unwrap().unwrap();
