@@ -180,23 +180,27 @@ fn parse_rc(
     let rc_id = id_raw
         .parse::<i32>()
         .map_err(|e| EcError::Runtime(format!("invalid rc id '{id_raw}': {e}")))?;
-    let proto = proto_raw
-        .as_deref()
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(0);
+    let proto = match proto_raw.as_deref().unwrap_or("0").parse::<i32>() {
+        Ok(proto) => proto,
+        Err(_) => return Ok(()),
+    };
     let svc = svc.unwrap_or_default();
     let name = name.unwrap_or_default();
-    let hosts = split_hosts(&host_raw);
-    let ports = split_ports(&port_raw);
-    if hosts.is_empty() || ports.is_empty() {
+    let hosts = host_raw.split(';');
+    let ports = port_raw.split(';');
+    if hosts.clone().count() != ports.clone().count() {
         return Ok(());
     }
 
-    if hosts.len() != ports.len() {
-        return Ok(());
-    }
-
-    for (host, port) in hosts.into_iter().zip(ports) {
+    // Pair by source position before rejecting malformed entries.
+    for (host, port) in hosts.zip(ports) {
+        let host = normalize_host_token(host);
+        if host.is_empty() {
+            continue;
+        }
+        let Some(port) = parse_port_range(port) else {
+            continue;
+        };
         rules.push(RouteRule {
             rc_id,
             proto,
@@ -308,13 +312,6 @@ fn decode_attr_value(attr: &Attribute<'_>, reader: &Reader<&[u8]>) -> EcResult<S
         .map_err(|e| EcError::Runtime(format!("xml attr decode failed: {e}")))
 }
 
-fn split_hosts(raw: &str) -> Vec<String> {
-    raw.split(';')
-        .map(normalize_host_token)
-        .filter(|h| !h.is_empty())
-        .collect()
-}
-
 fn normalize_host_token(raw: &str) -> String {
     let mut token = raw.trim();
     token = token
@@ -324,60 +321,45 @@ fn normalize_host_token(raw: &str) -> String {
     token.split('/').next().unwrap_or("").trim().to_string()
 }
 
-fn split_ports(raw: &str) -> Vec<PortRange> {
-    raw.split(';')
-        .filter_map(|token| {
-            let t = token.trim();
-            if t.is_empty() {
-                return None;
-            }
-            if let Some((a, b)) = t.split_once('~') {
-                let Ok(start) = a.trim().parse::<u16>() else {
-                    return None;
-                };
-                let Ok(end) = b.trim().parse::<u16>() else {
-                    return None;
-                };
-                return Some(PortRange { start, end });
-            }
-            let Ok(port) = t.parse::<u16>() else {
-                return None;
-            };
-            Some(PortRange {
-                start: port,
-                end: port,
-            })
+fn parse_port_range(raw: &str) -> Option<PortRange> {
+    let raw = raw.trim();
+    if let Some((start, end)) = raw.split_once('~') {
+        Some(PortRange {
+            start: start.trim().parse().ok()?,
+            end: end.trim().parse().ok()?,
         })
-        .collect()
+    } else {
+        let port = raw.parse().ok()?;
+        Some(PortRange {
+            start: port,
+            end: port,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_xml_payload, parse_dns_record_item, parse_route_table_xml, split_hosts, split_ports,
+        extract_xml_payload, normalize_host_token, parse_dns_record_item, parse_port_range,
+        parse_route_table_xml,
     };
 
     #[test]
-    fn split_hosts_normalizes_scheme_and_path() {
-        let hosts = split_hosts("http://a.example/x;https://b.example;y.example");
-        assert_eq!(
-            hosts,
-            vec![
-                "a.example".to_string(),
-                "b.example".to_string(),
-                "y.example".to_string()
-            ]
-        );
+    fn host_tokens_normalize_scheme_and_path() {
+        assert_eq!(normalize_host_token("http://a.example/x"), "a.example");
+        assert_eq!(normalize_host_token("https://b.example"), "b.example");
+        assert_eq!(normalize_host_token("y.example"), "y.example");
     }
 
     #[test]
-    fn split_ports_parses_ranges() {
-        let ports = split_ports("80~80;443~445;53");
-        assert_eq!(ports.len(), 3);
-        assert_eq!(ports[0].start, 80);
-        assert_eq!(ports[1].end, 445);
-        assert_eq!(ports[2].start, 53);
-        assert_eq!(ports[2].end, 53);
+    fn port_tokens_parse_ranges() {
+        assert_eq!(parse_port_range("80~80").unwrap().start, 80);
+        assert_eq!(parse_port_range("443~445").unwrap().end, 445);
+        let dns = parse_port_range("53").unwrap();
+        assert_eq!((dns.start, dns.end), (53, 53));
+        for invalid in ["", "bad", "65536", "80~", "~443", "80~bad", "80~443~445"] {
+            assert!(parse_port_range(invalid).is_none());
+        }
     }
 
     #[test]
@@ -428,6 +410,56 @@ mod tests {
         assert_eq!(table.rules[0].rc_id, 206);
         assert_eq!(table.rules[0].host, "c.example");
         assert_eq!(table.rules[0].port.start, 80);
+    }
+
+    #[test]
+    fn invalid_list_entries_never_shift_host_port_pairs() {
+        for (hosts, ports, expected) in [
+            ("a.test;;c.test", "80;443;bad", vec![("a.test", 80)]),
+            (";b.test;c.test", "80;bad;443", vec![("c.test", 443)]),
+            (
+                "a.test;b.test;c.test",
+                "80;bad;443",
+                vec![("a.test", 80), ("c.test", 443)],
+            ),
+            (
+                "a.test;;c.test",
+                "80;443;8080",
+                vec![("a.test", 80), ("c.test", 8080)],
+            ),
+            ("a.test;b.test", "80;bad;443", vec![]),
+        ] {
+            let xml =
+                format!("<Resource><Rc id=\"1\" host=\"{hosts}\" port=\"{ports}\"/></Resource>");
+            let table = parse_route_table_xml(&xml).unwrap();
+            let pairs: Vec<_> = table
+                .rules
+                .iter()
+                .map(|rule| (rule.host.as_str(), rule.port.start))
+                .collect();
+            assert_eq!(pairs, expected, "host={hosts:?}, port={ports:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_protocol_is_not_treated_as_tcp() {
+        let table = parse_route_table_xml(
+            r#"<Resource>
+              <Rc id="1" host="bad.test" port="443" proto="udp"/>
+              <Rc id="2" host="empty.test" port="443" proto=""/>
+              <Rc id="3" host="default.test" port="443"/>
+              <Rc id="4" host="tcp.test" port="443" proto="0"/>
+              <Rc id="5" host="any.test" port="443" proto="-1"/>
+              <Rc id="6" host="udp.test" port="53" proto="1"/>
+            </Resource>"#,
+        )
+        .unwrap();
+        let protocols: Vec<_> = table
+            .rules
+            .iter()
+            .map(|rule| (rule.rc_id, rule.proto))
+            .collect();
+        assert_eq!(protocols, [(3, 0), (4, 0), (5, -1), (6, 1)]);
     }
 
     #[test]
