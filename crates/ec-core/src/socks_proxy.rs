@@ -205,6 +205,12 @@ fn read_socks5_connect_reply(stream: &mut TcpStream) -> EcResult<()> {
             head[0]
         )));
     }
+    if head[2] != SOCKS_RSV {
+        return Err(EcError::Runtime(format!(
+            "invalid fallback proxy reserved byte: 0x{:02x}",
+            head[2]
+        )));
+    }
     if head[1] != SOCKS_REP_SUCCEEDED {
         let code = format!("0x{:02x}", head[1]);
         return Err(EcError::Runtime(format!(
@@ -257,7 +263,7 @@ fn ensure_http_connect_success(reply_head: &str) -> EcResult<()> {
                 "invalid http proxy connect status line: {status_line}"
             ))
         })?;
-    if code != 200 {
+    if !(200..300).contains(&code) {
         return Err(EcError::Runtime(format!(
             "http proxy connect rejected: {status_line}"
         )));
@@ -312,6 +318,11 @@ fn consume_socks5_addr_and_port(stream: &mut TcpStream, atyp: u8) -> EcResult<()
         SOCKS_ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             read_proxy_exact(stream, &mut len, "fallback proxy connect reply")?;
+            if len[0] == 0 {
+                return Err(EcError::Runtime(
+                    "fallback proxy reply has an empty bind domain".to_string(),
+                ));
+            }
             let mut buf = vec![0u8; len[0] as usize];
             read_proxy_exact(stream, &mut buf, "fallback proxy connect reply")?;
         }
@@ -435,15 +446,19 @@ mod tests {
     }
 
     #[test]
-    fn http_connect_success_accepts_200() {
-        ensure_http_connect_success("HTTP/1.1 200 Connection Established\r\n\r\n").unwrap();
+    fn http_connect_success_accepts_any_2xx() {
+        for code in [200, 201, 204, 299] {
+            ensure_http_connect_success(&format!("HTTP/1.1 {code} Connected\r\n\r\n")).unwrap();
+        }
     }
 
     #[test]
-    fn http_connect_success_rejects_non_200() {
-        let err = ensure_http_connect_success("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
-            .unwrap_err();
-        assert!(err.to_string().contains("http proxy connect rejected"));
+    fn http_connect_success_rejects_non_2xx() {
+        for code in [199, 300, 407, 503] {
+            let err = ensure_http_connect_success(&format!("HTTP/1.1 {code} Rejected\r\n\r\n"))
+                .unwrap_err();
+            assert!(err.to_string().contains("http proxy connect rejected"));
+        }
     }
 
     #[test]
@@ -469,6 +484,54 @@ mod tests {
 
         assert!(request.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"));
         assert!(request.contains("Host: [2001:db8::1]:443\r\n"));
+    }
+
+    #[test]
+    fn malformed_socks5_success_replies_are_rejected() {
+        for (reply, expected) in [
+            (vec![5, 0, 1, 1, 127, 0, 0, 1, 0, 0], "reserved byte"),
+            (vec![5, 0, 0, 3, 0, 0, 0], "empty bind domain"),
+        ] {
+            let (addr, proxy) = spawn_test_proxy(move |mut stream| {
+                negotiate_test_socks5_greeting(&mut stream);
+                read_test_socks5_connect_request(&mut stream);
+                stream.write_all(&reply).unwrap();
+            });
+            let result = connect_via_socks5_proxy_with_timeout(
+                &addr,
+                TEST_TARGET_HOST,
+                TEST_TARGET_PORT,
+                Duration::from_secs(2),
+            );
+            proxy.join().unwrap();
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn successful_http_connect_keeps_the_first_tunnel_payload() {
+        for code in [200, 204] {
+            let (addr, proxy) = spawn_test_proxy(move |mut stream| {
+                read_test_http_connect_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {code} Connected\r\nContent-Length: 999\r\n\r\nfirst payload"
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            });
+            let result = connect_via_http_connect_proxy_with_timeout(
+                &addr,
+                TEST_TARGET_HOST,
+                TEST_TARGET_PORT,
+                Duration::from_secs(2),
+            );
+            proxy.join().unwrap();
+            let mut stream = result.unwrap();
+            let mut payload = Vec::new();
+            stream.read_to_end(&mut payload).unwrap();
+            assert_eq!(payload, b"first payload");
+            assert_eq!(stream.read_timeout().unwrap(), None);
+        }
     }
 
     #[test]
