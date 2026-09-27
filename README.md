@@ -130,12 +130,14 @@ Supported fallback proxy input formats:
 ### Run From Source
 
 1. Install Rust stable
-2. Install OpenSSL development dependencies (your system may already have them)
+2. Install a C/C++ compiler, CMake and libclang (plus NASM on Windows; your system may already have these tools)
 3. Run with Cargo
 
 ```bash
 SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME>
 ```
+
+TLS uses AWS-LC, built and statically linked by Cargo. No OpenSSL installation is required at build time or runtime. The `openssl` Rust crate remains as the maintained TLS interface, using its `aws-lc` backend for EasyConnect's legacy TLS requirements. See the [AWS-LC build requirements](https://aws.github.io/aws-lc-rs/requirements/index.html) for platform setup.
 
 ### Diagnostics
 
