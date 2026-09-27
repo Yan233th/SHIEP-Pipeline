@@ -210,7 +210,7 @@ fn style_ansi256(code: u8) -> Style {
 }
 
 fn timestamp_parts() -> (String, String, String) {
-    let now = Local::now();
+    let now = Local::now().naive_local();
     (
         now.format("%Y/").to_string(),
         now.format("%m/%d").to_string(),

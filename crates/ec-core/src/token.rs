@@ -20,20 +20,20 @@ pub fn fetch_agent_token(server: &str, twf_id: &str) -> EcResult<String> {
         .write_all(request.as_bytes())
         .map_err(|e| EcError::Runtime(format!("token request write failed: {e}")))?;
 
-    let mut sink = Vec::new();
+    let mut received_response = false;
     let mut buf = [0u8; 4096];
     let deadline = Instant::now() + TOKEN_READ_DEADLINE;
     while Instant::now() < deadline {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => sink.extend_from_slice(&buf[..n]),
+            Ok(_) => received_response = true,
             Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
                 break;
             }
             Err(e) => return Err(EcError::Runtime(format!("token response read failed: {e}"))),
         }
     }
-    if sink.is_empty() {
+    if !received_response {
         return Err(EcError::Runtime(
             "token response is empty or timed out".to_string(),
         ));
