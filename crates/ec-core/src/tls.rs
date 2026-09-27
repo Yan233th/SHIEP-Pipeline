@@ -53,6 +53,19 @@ pub(crate) fn new_insecure_connector(context: &str) -> EcResult<SslConnector> {
     Ok(new_insecure_connector_builder(context)?.build())
 }
 
+pub(crate) fn new_vpn_ssl(host: &str) -> EcResult<Ssl> {
+    let mut builder = new_insecure_connector_builder("vpn")?;
+    builder
+        .set_cipher_list("RC4-SHA:AES128-SHA:AES256-SHA")
+        .map_err(|e| EcError::Runtime(format!("set cipher list failed: {e}")))?;
+    let connector = builder.build();
+    let mut ssl = into_insecure_ssl_with(&connector, host, "vpn", |config| {
+        config.set_use_server_name_indication(false);
+    })?;
+    crate::protocol_session::apply_l3ip_session_id(&mut ssl, 0x0303)?;
+    Ok(ssl)
+}
+
 pub(crate) fn into_insecure_ssl(
     connector: &SslConnector,
     host: &str,
@@ -84,3 +97,7 @@ pub(crate) fn handshake(ssl: Ssl, tcp: TcpStream, context: &str) -> EcResult<Ssl
     ssl.connect(tcp)
         .map_err(|e| EcError::Runtime(format!("{context} tls handshake failed: {e}")))
 }
+
+#[cfg(test)]
+#[path = "tls_tests.rs"]
+mod tests;

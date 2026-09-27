@@ -811,19 +811,13 @@ fn debug_tls_summary(_: &SslStream<TcpStream>) {}
 
 fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
     let tcp = crate::tls::connect_vpn_tcp(authority, Duration::from_secs(5))?;
-    let mut builder = crate::tls::new_insecure_connector_builder("vpn")?;
-    builder.set_security_level(0);
-    builder
-        .set_cipher_list("RC4-SHA:AES128-SHA:AES256-SHA")
-        .map_err(|e| EcError::Runtime(format!("set cipher list failed: {e}")))?;
-
-    let connector = builder.build();
-    let mut ssl = crate::tls::into_insecure_ssl_with(&connector, host, "vpn", |config| {
-        config.set_use_server_name_indication(false);
-    })?;
-    crate::protocol_session::apply_l3ip_session_id(&mut ssl, 0x0303)?;
-
+    let ssl = crate::tls::new_vpn_ssl(host)?;
     let stream = crate::tls::handshake(ssl, tcp, "vpn")?;
+    if stream.ssl().session_reused() {
+        return Err(EcError::Runtime(
+            "vpn resumed a synthetic l3ip session".to_string(),
+        ));
+    }
     debug_tls_summary(&stream);
     Ok(stream)
 }
