@@ -8,7 +8,7 @@ use crate::protocol_wire::{
     build_tx_heartbeat_packet, parse_command_control_reply, parse_native_control_frame,
     parse_protocol_token, parse_send_ip_reply,
 };
-use openssl::ssl::SslStream;
+use legacy_tls::TlsStream;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock, mpsc};
@@ -165,7 +165,6 @@ impl StreamOpenError {
 #[derive(Clone)]
 struct TunnelRuntimeParams {
     authority: String,
-    host: String,
     token: [u8; PROTOCOL_TOKEN_LEN],
     assigned_ip: [u8; 4],
     ip_rev: [u8; 4],
@@ -174,16 +173,10 @@ struct TunnelRuntimeParams {
 }
 
 impl TunnelRuntimeParams {
-    fn new(
-        authority: String,
-        host: String,
-        token: [u8; PROTOCOL_TOKEN_LEN],
-        ips: TunnelIps,
-    ) -> Self {
+    fn new(authority: String, token: [u8; PROTOCOL_TOKEN_LEN], ips: TunnelIps) -> Self {
         let heartbeat_tail = new_heartbeat_tail(&token, ips.assigned_ip);
         Self {
             authority,
-            host,
             token,
             assigned_ip: ips.assigned_ip,
             ip_rev: [
@@ -197,10 +190,9 @@ impl TunnelRuntimeParams {
         }
     }
 
-    fn open_stream(&self, profile: StreamProfile) -> EcResult<SslStream<TcpStream>> {
+    fn open_stream(&self, profile: StreamProfile) -> EcResult<TlsStream<TcpStream>> {
         open_data_stream_with_retries(
             &self.authority,
-            &self.host,
             &self.token,
             &self.ip_rev,
             profile,
@@ -213,10 +205,9 @@ impl TunnelRuntimeParams {
         &self,
         profile: StreamProfile,
         retries: usize,
-    ) -> EcResult<SslStream<TcpStream>> {
+    ) -> EcResult<TlsStream<TcpStream>> {
         open_data_stream_with_retries(
             &self.authority,
-            &self.host,
             &self.token,
             &self.ip_rev,
             profile,
@@ -270,21 +261,21 @@ impl From<SendIpReply> for CommandStreamInit {
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
 // L3IP op0/SEND_IP leaves a command/control stream open. Official op3
 // heartbeat must stay on that same stream instead of the RX/TX data streams.
-static COMMAND_STREAM_HOLDER: OnceLock<Mutex<Option<SslStream<TcpStream>>>> = OnceLock::new();
+static COMMAND_STREAM_HOLDER: OnceLock<Mutex<Option<TlsStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamInit> {
-    let (authority, host) = parse_server(server)?;
+    let (authority, _) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
 
-    open_command_stream_once(&authority, &host, &token_bytes)
+    open_command_stream_once(&authority, &token_bytes)
 }
 
 pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResult<()> {
     crate::runtime_state::clear_fatal_reason();
 
-    let (authority, host) = parse_server(server)?;
+    let (authority, _) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
-    let runtime = TunnelRuntimeParams::new(authority, host, token_bytes, ips);
+    let runtime = TunnelRuntimeParams::new(authority, token_bytes, ips);
 
     let rx_stream = runtime.open_stream(StreamProfile::Rx)?;
     output::success(Scope::Protocol, "RX handshake successful");
@@ -392,10 +383,9 @@ fn handle_worker_exit(profile: StreamProfile, result: EcResult<()>) {
 
 fn open_command_stream_once(
     authority: &str,
-    host: &str,
     token_bytes: &[u8; PROTOCOL_TOKEN_LEN],
 ) -> EcResult<CommandStreamInit> {
-    let mut stream = connect_vpn_tls(authority, host)?;
+    let mut stream = connect_vpn_tls(authority)?;
 
     let message = build_initial_query_ip_message(token_bytes);
     stream
@@ -431,7 +421,7 @@ fn open_command_stream_once(
 
 fn rx_worker_loop(
     runtime: TunnelRuntimeParams,
-    mut stream: SslStream<TcpStream>,
+    mut stream: TlsStream<TcpStream>,
     tx: mpsc::Sender<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
@@ -480,7 +470,7 @@ fn should_forward_rx_payload(data: &[u8]) -> EcResult<bool> {
 
 fn tx_worker_loop(
     runtime: TunnelRuntimeParams,
-    mut stream: SslStream<TcpStream>,
+    mut stream: TlsStream<TcpStream>,
     rx: mpsc::Receiver<Vec<u8>>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
@@ -514,13 +504,12 @@ fn tx_worker_loop(
 
 fn open_data_stream_with_retries(
     authority: &str,
-    host: &str,
     token: &[u8; PROTOCOL_TOKEN_LEN],
     ip_rev: &[u8; 4],
     profile: StreamProfile,
     kind: StreamOpenKind,
     retry: StreamOpenRetry,
-) -> EcResult<SslStream<TcpStream>> {
+) -> EcResult<TlsStream<TcpStream>> {
     let mut attempt = retry.first_attempt;
     let mut last_error = None;
     while attempt <= STREAM_RETRY_LIMIT {
@@ -528,7 +517,7 @@ fn open_data_stream_with_retries(
             thread::sleep(STREAM_RETRY_DELAY);
         }
         debug_stream_open_attempt(profile, kind, retry.phase, attempt);
-        match open_data_stream(authority, host, token, ip_rev, profile, kind) {
+        match open_data_stream(authority, token, ip_rev, profile, kind) {
             Ok(stream) => return Ok(stream),
             Err(err) => {
                 let concise = crate::error::concise_error(err.error());
@@ -555,13 +544,12 @@ fn open_data_stream_with_retries(
 
 fn open_data_stream(
     authority: &str,
-    host: &str,
     token: &[u8; PROTOCOL_TOKEN_LEN],
     ip_rev: &[u8; 4],
     profile: StreamProfile,
     kind: StreamOpenKind,
-) -> Result<SslStream<TcpStream>, StreamOpenError> {
-    let mut stream = connect_vpn_tls(authority, host).map_err(StreamOpenError::retryable)?;
+) -> Result<TlsStream<TcpStream>, StreamOpenError> {
+    let mut stream = connect_vpn_tls(authority).map_err(StreamOpenError::retryable)?;
     let op_code = profile.op_code(kind);
     let expected_ack = profile.expected_ack();
 
@@ -692,7 +680,7 @@ fn unexpected_stream_ack_err(
 }
 
 fn clear_data_stream_read_timeout(
-    stream: &SslStream<TcpStream>,
+    stream: &TlsStream<TcpStream>,
     profile: StreamProfile,
 ) -> EcResult<()> {
     stream.get_ref().set_read_timeout(None).map_err(|e| {
@@ -786,17 +774,13 @@ fn debug_protocol_hex(label: impl std::fmt::Display, data: &[u8]) {
 fn debug_protocol_hex(_: impl std::fmt::Display, _: &[u8]) {}
 
 #[cfg(debug_assertions)]
-fn debug_tls_summary(stream: &SslStream<TcpStream>) {
+fn debug_tls_summary(stream: &TlsStream<TcpStream>) {
     if !output::is_debug_enabled() {
         return;
     }
 
-    let ssl = stream.ssl();
-    let version = ssl.version_str();
-    let cipher = ssl
-        .current_cipher()
-        .map(|cipher| cipher.name())
-        .unwrap_or("unknown");
+    let version = stream.version().name();
+    let cipher = stream.cipher_suite().name();
     output::debug(
         Scope::Protocol,
         format_args!(
@@ -807,22 +791,16 @@ fn debug_tls_summary(stream: &SslStream<TcpStream>) {
 }
 
 #[cfg(not(debug_assertions))]
-fn debug_tls_summary(_: &SslStream<TcpStream>) {}
+fn debug_tls_summary(_: &TlsStream<TcpStream>) {}
 
-fn connect_vpn_tls(authority: &str, host: &str) -> EcResult<SslStream<TcpStream>> {
+fn connect_vpn_tls(authority: &str) -> EcResult<TlsStream<TcpStream>> {
     let tcp = crate::tls::connect_vpn_tcp(authority, Duration::from_secs(5))?;
-    let ssl = crate::tls::new_vpn_ssl(host)?;
-    let stream = crate::tls::handshake(ssl, tcp, "vpn")?;
-    if stream.ssl().session_reused() {
-        return Err(EcError::Runtime(
-            "vpn resumed a synthetic l3ip session".to_string(),
-        ));
-    }
+    let stream = crate::tls::handshake(&crate::tls::vpn_config(), tcp, "vpn")?;
     debug_tls_summary(&stream);
     Ok(stream)
 }
 
-fn hold_command_stream(stream: SslStream<TcpStream>) -> EcResult<()> {
+fn hold_command_stream(stream: TlsStream<TcpStream>) -> EcResult<()> {
     let holder = COMMAND_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
     let mut guard = holder
         .lock()
@@ -894,7 +872,7 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
 }
 
 fn send_command_heartbeat(
-    stream: &mut SslStream<TcpStream>,
+    stream: &mut TlsStream<TcpStream>,
     token: &[u8; PROTOCOL_TOKEN_LEN],
 ) -> Result<(), CommandHeartbeatFailure> {
     let message = build_command_message(3, token);
@@ -965,7 +943,7 @@ impl CommandHeartbeatOutcome {
 }
 
 fn read_at_least<S: Read + Write>(
-    stream: &mut SslStream<S>,
+    stream: &mut TlsStream<S>,
     buf: &mut [u8],
     min_len: usize,
     timeout: Duration,
@@ -987,7 +965,7 @@ fn read_at_least<S: Read + Write>(
 }
 
 fn read_stream_once<S: Read + Write>(
-    stream: &mut SslStream<S>,
+    stream: &mut TlsStream<S>,
     buf: &mut [u8],
     timeout: Duration,
 ) -> EcResult<usize> {
@@ -1150,7 +1128,6 @@ mod tests {
         token[32..48].copy_from_slice(b"eab27cdf7c24a40f");
         let runtime = TunnelRuntimeParams::new(
             "vpn.example:443".to_string(),
-            "vpn.example".to_string(),
             token,
             TunnelIps {
                 assigned_ip: [10, 166, 80, 12],

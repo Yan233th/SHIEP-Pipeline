@@ -7,13 +7,14 @@ edition = "2024"
 anstream = "0.6.21"
 anstyle = "1.0.13"
 chrono = "0.4.44"
-der = { version = "0.7.10", features = ["alloc"] }
 hex = "0.4.3"
 hickory-proto = { version = "0.25.2", default-features = false, features = ["std"] }
-openssl = { version = "0.10.81", features = ["aws-lc"] }
+legacy-tls = { version = "0.1.0", path = "../legacy-tls" }
 quick-xml = "0.39.2"
-reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls-no-provider"] }
 rsa = "0.9.10"
+rustls = { version = "0.23.36", default-features = false, features = ["std", "tls12"] }
+rustls-rustcrypto = "0.0.2-alpha"
 socket2 = { version = "0.6.2", features = ["all"] }
 smoltcp = { version = "0.12.0", default-features = false, features = ["std", "proto-ipv4", "socket", "socket-tcp", "medium-ip", "alloc"] }
 thiserror = "2.0.18"

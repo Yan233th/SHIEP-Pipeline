@@ -77,11 +77,9 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
     parse_route_table_xml(xml_payload)
 }
 
-fn connect_tls(authority: &str, host: &str) -> EcResult<openssl::ssl::SslStream<TcpStream>> {
+fn connect_tls(authority: &str, host: &str) -> EcResult<legacy_tls::TlsStream<TcpStream>> {
     let tcp = crate::tls::connect_tcp_with_timeout(authority, Duration::from_secs(5), "rclist")?;
-    let connector = crate::tls::new_insecure_connector("rclist")?;
-    let ssl = crate::tls::into_insecure_ssl(&connector, host, "rclist")?;
-    crate::tls::handshake(ssl, tcp, "rclist")
+    crate::tls::connect_http(tcp, host, "rclist")
 }
 
 fn parse_route_table_xml(xml: &str) -> EcResult<RouteTable> {

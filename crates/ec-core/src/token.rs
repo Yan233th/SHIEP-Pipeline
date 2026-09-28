@@ -11,9 +11,7 @@ pub fn fetch_agent_token(server: &str, twf_id: &str) -> EcResult<String> {
     let (authority, host) = parse_server(server)?;
 
     let tcp = crate::tls::connect_tcp_with_timeout(&authority, TOKEN_IO_TIMEOUT, "token")?;
-    let connector = crate::tls::new_insecure_connector("token")?;
-    let ssl = crate::tls::into_insecure_ssl(&connector, &host, "token")?;
-    let mut stream = crate::tls::handshake(ssl, tcp, "token")?;
+    let mut stream = crate::tls::connect_http(tcp, &host, "token")?;
 
     let request = build_token_request(&authority, twf_id);
     stream
@@ -39,16 +37,13 @@ pub fn fetch_agent_token(server: &str, twf_id: &str) -> EcResult<String> {
         ));
     }
 
-    let session = stream
-        .ssl()
-        .session()
-        .ok_or_else(|| EcError::Runtime("missing server tls session".to_string()))?;
-    if session.id().is_empty() {
+    let session_id = stream.session_id();
+    if session_id.is_empty() {
         return Err(EcError::Runtime(
             "server tls session id is empty".to_string(),
         ));
     }
-    let session_id_hex = hex::encode(session.id());
+    let session_id_hex = hex::encode(session_id);
     if session_id_hex.len() < TOKEN_SESSION_HEX_SLICE_LEN {
         return Err(EcError::Runtime(format!(
             "server session id hex too short: {}",

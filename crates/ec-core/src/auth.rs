@@ -89,7 +89,7 @@ pub fn login(config: &AppConfig) -> EcResult<String> {
 
 fn build_http_client() -> EcResult<Client> {
     Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_backend_preconfigured(crate::tls::http_config()?)
         .build()
         .map_err(|e| EcError::Runtime(format!("http client build failed: {e}")))
 }

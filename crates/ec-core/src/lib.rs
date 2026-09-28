@@ -9,7 +9,6 @@ mod endpoint;
 mod netstack;
 mod netstack_device;
 mod protocol;
-mod protocol_session;
 mod protocol_wire;
 mod route_table;
 mod routing;
