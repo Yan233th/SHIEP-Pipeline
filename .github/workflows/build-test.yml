@@ -1,0 +1,69 @@
+name: Build Test Binaries
+run-name: Test binaries (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target_label }})
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            target_label: linux-x64
+            suffix: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            target_label: macos-arm64
+            suffix: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            target_label: windows-x64
+            suffix: .exe
+
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (official rustup)
+        run: rustup toolchain install stable --profile minimal --no-self-update --target ${{ matrix.target }}
+
+      - name: Toolchain versions
+        run: |
+          rustc +stable -V
+          cargo +stable -V
+
+      - name: Test workspace
+        run: cargo +stable test --locked --workspace --target ${{ matrix.target }}
+
+      - name: Build and check debug binary
+        env:
+          SHIEP_PIPELINE_VERSION: test-${{ steps.checkout.outputs.commit }}
+        run: cargo +stable run --locked -p ec-cli --target ${{ matrix.target }} -- --version
+
+      - name: Build and check release binary
+        env:
+          SHIEP_PIPELINE_VERSION: test-${{ steps.checkout.outputs.commit }}
+        run: cargo +stable run --locked --release -p ec-cli --target ${{ matrix.target }} -- --version
+
+      - name: Upload test binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: SHIEP-Pipeline-${{ matrix.target_label }}
+          path: |
+            target/${{ matrix.target }}/debug/SHIEP-Pipeline${{ matrix.suffix }}
+            target/${{ matrix.target }}/release/SHIEP-Pipeline${{ matrix.suffix }}
+          if-no-files-found: error
+          retention-days: 14
