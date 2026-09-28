@@ -2,6 +2,7 @@
 members = [
     "crates/ec-cli",
     "crates/ec-core",
+    "crates/legacy-tls",
 ]
 resolver = "2"
 

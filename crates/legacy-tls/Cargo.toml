@@ -1,0 +1,23 @@
+[package]
+name = "legacy-tls"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A focused pure-Rust blocking TLS 1.1/1.2 client for legacy services"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Yan233th/SHIEP-Pipeline"
+readme = "README.md"
+keywords = ["tls", "legacy", "rustcrypto"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+aes = { version = "0.8.4", features = ["zeroize"] }
+hmac = "0.12.1"
+md-5 = "0.10.6"
+rsa = "0.9.10"
+sha1 = { version = "0.10.6", features = ["compress"] }
+sha2 = "0.10.9"
+subtle = "2.6.1"
+thiserror = "2.0.18"
+x509-cert = { version = "0.2.5", default-features = false, features = ["std"] }
+zeroize = "1.9.0"

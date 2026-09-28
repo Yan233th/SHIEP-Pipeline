@@ -1,0 +1,14 @@
+[package]
+name = "legacy-tls-interop"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+aws-lc = ["openssl/aws-lc"]
+
+[dependencies]
+legacy-tls = { path = "../../crates/legacy-tls" }
+openssl = "0.10.81"
