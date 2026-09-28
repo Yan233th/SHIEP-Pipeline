@@ -21,14 +21,17 @@ enforce server-authentication and key-encipherment certificate usage.
 The crate creates no threads, timers, sockets, or polling loops. Pass a blocking
 `Read + Write` transport and configure its timeouts before connecting. Reads
 preserve partial TLS records on timeout. Writes apply record-sized backpressure;
-a failed write makes the connection unusable to avoid replaying a partial record.
-EOF without close_notify is an error. Dropping a stream performs no I/O.
+a failed write or flush makes the connection unusable to avoid replaying a
+partial record. Reads assemble fragmented control messages, reply to
+close_notify, and decline renegotiation. EOF without close_notify is an error.
+Dropping a stream performs no I/O.
 
 The CBC MAC-then-encrypt receive path computes SHA-1 HMAC with fixed work and
 memory accesses for a given public record length, using RustCrypto's compression
 function and `subtle` selection. It does not hash a slice selected by decrypted
 padding. This design still requires independent timing analysis and security
 review; unit tests and interoperability do not establish side-channel safety.
+See [SECURITY.md](SECURITY.md) for the review scope and reproducible checks.
 
 ```rust,no_run
 use legacy_tls::{CertificateVerifier, ClientConfig, Error};
