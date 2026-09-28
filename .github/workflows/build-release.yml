@@ -41,17 +41,6 @@ jobs:
           rustc +stable -V
           cargo +stable -V
 
-      # Hosted runners already provide C/C++, CMake and libclang for AWS-LC.
-      - name: Install NASM (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install nasm --yes --no-progress
-          if ($LASTEXITCODE -ne 0) {
-            throw "NASM installation failed"
-          }
-          "$env:ProgramFiles\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
       - name: Build binary
         run: cargo +stable build --locked --release -p ec-cli --target ${{ matrix.target }}
 

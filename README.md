@@ -130,14 +130,15 @@ Supported fallback proxy input formats:
 ### Run From Source
 
 1. Install Rust stable
-2. Install a C/C++ compiler, CMake and libclang (plus NASM on Windows; your system may already have these tools)
-3. Run with Cargo
+2. Run with Cargo
 
 ```bash
 SHIEP_PIPELINE_PASSWORD=<PASSWORD> cargo run -p ec-cli -- --server <VPN_SERVER> --username <USERNAME>
 ```
 
-TLS uses AWS-LC, built and statically linked by Cargo. No OpenSSL installation is required at build time or runtime. The `openssl` Rust crate remains as the maintained TLS interface, using its `aws-lc` backend for EasyConnect's legacy TLS requirements. See the [AWS-LC build requirements](https://aws.github.io/aws-lc-rs/requirements/index.html) for platform setup.
+TLS uses Rust implementations: rustls with RustCrypto for HTTPS login, and the local [legacy-tls](crates/legacy-tls) crate for the gateway's legacy TLS transport. The application has no OpenSSL or AWS-LC dependency; a normal Rust toolchain and platform linker are sufficient, without CMake, libclang or NASM.
+
+The legacy TLS crate and RustCrypto's rustls provider are experimental. The new transport has interoperability and live VPN tests, but has not had an independent security audit. See the [crate documentation](crates/legacy-tls/README.md) for its scope and security boundaries.
 
 ### Diagnostics
 
@@ -153,6 +154,7 @@ This enables verbose protocol diagnostics such as TLS summaries, stream reconnec
 
 - `crates/ec-cli`: CLI entry point and argument parsing
 - `crates/ec-core`: Core implementation (login, protocol, tunnel, netstack, route-table parsing, and forwarding)
+- `crates/legacy-tls`: Independently packageable Rust TLS 1.1/1.2 client for the legacy gateway
 - `.github/workflows/build-release.yml`: Build and upload release artifacts on `release.published`
 
 ## Release Artifacts
