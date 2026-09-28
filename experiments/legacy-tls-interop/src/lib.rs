@@ -8,7 +8,11 @@ use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
-use openssl::ssl::{NameType, Ssl, SslContext, SslMethod, SslOptions, SslVersion};
+use openssl::sign::Signer;
+use openssl::ssl::{
+    NameType, ShutdownResult, Ssl, SslContext, SslMethod, SslOptions, SslRef, SslVersion,
+};
+use openssl::symm::{Cipher, Crypter, Mode};
 use openssl::x509::{X509, X509NameBuilder};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -97,7 +101,9 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
                     stream.read_exact(&mut received).unwrap();
                     assert_eq!(received, expected);
                     stream.write_all(&received).unwrap();
-                    stream.shutdown().unwrap();
+                    assert_eq!(stream.shutdown().unwrap(), ShutdownResult::Sent);
+                    assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+                    assert_eq!(stream.shutdown().unwrap(), ShutdownResult::Received);
                 });
                 let mut config = ClientConfig::new(Arc::new(NoCertificateVerification));
                 config.min_version = version;
@@ -158,23 +164,31 @@ fn raw_eof_is_not_reported_as_clean_tls_shutdown() {
     server.join().unwrap();
 }
 
-// Alter the native server's first encrypted handshake record, after its CCS.
-// The client must authenticate Finished before returning an established stream.
+// Hold the native server's Finished until accept returns, allowing tests to
+// alter either its ciphertext or its authenticated contents using native keys.
 #[derive(Debug)]
-struct TamperedFinished {
+struct HeldFinished {
     io: TcpStream,
     pending: Vec<u8>,
     encrypted: bool,
-    altered: bool,
+    finished: Vec<u8>,
+    client_prefix: Vec<u8>,
+    randoms: [u8; 64],
 }
 
-impl Read for TamperedFinished {
+impl Read for HeldFinished {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.io.read(out)
+        let len = self.io.read(out)?;
+        let take = len.min(43 - self.client_prefix.len());
+        self.client_prefix.extend_from_slice(&out[..take]);
+        if self.client_prefix.len() == 43 {
+            self.randoms[32..].copy_from_slice(&self.client_prefix[11..43]);
+        }
+        Ok(len)
     }
 }
 
-impl Write for TamperedFinished {
+impl Write for HeldFinished {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.pending.extend_from_slice(bytes);
         while self.pending.len() >= 5 {
@@ -182,10 +196,13 @@ impl Write for TamperedFinished {
             if self.pending.len() < len {
                 break;
             }
-            let mut record: Vec<u8> = self.pending.drain(..len).collect();
-            if record[0] == 22 && self.encrypted && !self.altered {
-                record[len - 1] ^= 1;
-                self.altered = true;
+            let record: Vec<u8> = self.pending.drain(..len).collect();
+            if record[0] == 22 && !self.encrypted && record[5] == 2 {
+                self.randoms[..32].copy_from_slice(&record[11..43]);
+            }
+            if record[0] == 22 && self.encrypted && self.finished.is_empty() {
+                self.finished = record;
+                continue;
             }
             if record[0] == 20 {
                 self.encrypted = true;
@@ -202,23 +219,135 @@ impl Write for TamperedFinished {
 
 #[test]
 fn tampered_server_finished_never_establishes_a_connection() {
+    let error = altered_finished(|_, _, record| {
+        let mut record = record.to_vec();
+        *record.last_mut().unwrap() ^= 1;
+        record
+    });
+    assert!(matches!(error, Error::BadRecordMac));
+}
+
+fn altered_finished(
+    alter: impl FnOnce(&SslRef, &[u8; 64], &[u8]) -> Vec<u8> + Send + 'static,
+) -> Error {
     let context = context(SslVersion::TLS1_2, "AES128-SHA");
     let (client, server) = sockets();
     let server = thread::spawn(move || {
-        let stream = Ssl::new(&context)
+        let mut stream = Ssl::new(&context)
             .unwrap()
-            .accept(TamperedFinished {
+            .accept(HeldFinished {
                 io: server,
                 pending: Vec::new(),
                 encrypted: false,
-                altered: false,
+                finished: Vec::new(),
+                client_prefix: Vec::new(),
+                randoms: [0; 64],
             })
             .unwrap();
-        assert!(stream.get_ref().altered);
+        assert!(!stream.get_ref().finished.is_empty());
+        let record = alter(
+            stream.ssl(),
+            &stream.get_ref().randoms,
+            &stream.get_ref().finished,
+        );
+        stream.get_mut().io.write_all(&record).unwrap();
+    });
+    let mut config = ClientConfig::new(Arc::new(NoCertificateVerification));
+    config.encrypt_then_mac = false;
+    let error = match config.connect(client) {
+        Ok(_) => panic!("altered Finished established a connection"),
+        Err(error) => error,
+    };
+    server.join().unwrap();
+    error
+}
+
+fn native_hmac(digest: MessageDigest, key: &[u8], data: &[u8]) -> Vec<u8> {
+    let key = PKey::hmac(key).unwrap();
+    let mut signer = Signer::new(digest, &key).unwrap();
+    signer.update(data).unwrap();
+    signer.sign_to_vec().unwrap()
+}
+
+fn native_cbc(mode: Mode, key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut cipher = Crypter::new(Cipher::aes_128_cbc(), mode, key, Some(iv)).unwrap();
+    cipher.pad(false);
+    let mut out = vec![0; data.len() + 16];
+    let len = cipher.update(data, &mut out).unwrap();
+    let len = len + cipher.finalize(&mut out[len..]).unwrap();
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn correctly_authenticated_but_wrong_finished_transcript_is_rejected() {
+    let error = altered_finished(|ssl, randoms, record| {
+        let mut master = [0; 48];
+        assert_eq!(ssl.session().unwrap().master_key(&mut master), 48);
+        let seed = [b"key expansion".as_slice(), randoms].concat();
+        let mut a = native_hmac(MessageDigest::sha256(), &master, &seed);
+        let mut key_block = Vec::new();
+        while key_block.len() < 72 {
+            key_block.extend(native_hmac(
+                MessageDigest::sha256(),
+                &master,
+                &[a.as_slice(), &seed].concat(),
+            ));
+            a = native_hmac(MessageDigest::sha256(), &master, &a);
+        }
+        let key = &key_block[56..72];
+        let iv = &record[5..21];
+        let mut plain = native_cbc(Mode::Decrypt, key, iv, &record[21..]);
+        assert_eq!(&plain[..4], &[20, 0, 0, 12]);
+        let mut mac_input = vec![0; 8];
+        mac_input.extend_from_slice(&[22, 3, 3, 0, 16]);
+        mac_input.extend_from_slice(&plain[..16]);
+        let mac_key = &key_block[20..40];
+        assert_eq!(
+            &plain[16..36],
+            native_hmac(MessageDigest::sha1(), mac_key, &mac_input)
+        );
+        plain[4] ^= 1;
+        mac_input[13..].copy_from_slice(&plain[..16]);
+        plain[16..36].copy_from_slice(&native_hmac(MessageDigest::sha1(), mac_key, &mac_input));
+        let encrypted = native_cbc(Mode::Encrypt, key, iv, &plain);
+        [record[..21].to_vec(), encrypted].concat()
     });
     assert!(matches!(
-        ClientConfig::new(Arc::new(NoCertificateVerification)).connect(client),
-        Err(Error::BadRecordMac)
+        error,
+        Error::Protocol("TLS Finished verification failed")
     ));
+}
+
+#[test]
+#[ignore = "manual release-mode sustained transfer diagnostic"]
+#[allow(clippy::assertions_on_constants)] // Debug suites compile this test but do not run it.
+fn sustained_legacy_transfer() {
+    assert!(!cfg!(debug_assertions), "run with --release");
+    let context = context(SslVersion::TLS1_1, "AES128-SHA");
+    let (client, server) = sockets();
+    let content: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i * 17) as u8).collect();
+    let expected = content.clone();
+    let server = thread::spawn(move || {
+        let mut stream = Ssl::new(&context).unwrap().accept(server).unwrap();
+        let mut received = vec![0; expected.len()];
+        stream.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected);
+        stream.write_all(&received).unwrap();
+        stream.shutdown().unwrap();
+        assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+    });
+    let mut config = ClientConfig::new(Arc::new(NoCertificateVerification));
+    config.min_version = Version::Tls11;
+    config.max_version = Version::Tls11;
+    config.encrypt_then_mac = false;
+    let mut stream = config.connect(client).unwrap();
+    let start = std::time::Instant::now();
+    stream.write_all(&content).unwrap();
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received).unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(received, content);
     server.join().unwrap();
+    eprintln!("TLS 1.1 AES128-SHA/MtE: 8 MiB each direction in {elapsed:?}");
 }

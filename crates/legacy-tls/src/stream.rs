@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 /// Read timeouts preserve partially received records and may be retried.
 /// A failed write terminates this connection because the transport may have
 /// accepted a partial record. No background tasks or implicit reconnects exist.
+/// Reads can write responses to close_notify and renegotiation requests.
 pub struct TlsStream<S> {
     pub(crate) io: S,
     pub(crate) reader: record::Reader,
@@ -22,6 +23,36 @@ pub struct TlsStream<S> {
     pub(crate) received_close: bool,
     pub(crate) sent_close: bool,
     pub(crate) failed: bool,
+    pub(crate) control: Control,
+}
+
+// Only alerts (2 bytes) and HelloRequest (4 bytes) are legal after the
+// handshake. Keep their cross-record fragments without allocating a queue.
+#[derive(Default)]
+pub(crate) struct Control {
+    kind: u8,
+    bytes: [u8; 4],
+    filled: usize,
+}
+
+impl Control {
+    fn consume(&mut self, kind: u8, input: &mut &[u8]) -> Result<Option<[u8; 4]>, Error> {
+        if self.filled != 0 && self.kind != kind {
+            return Err(Error::Protocol("interleaved TLS control messages"));
+        }
+        self.kind = kind;
+        let size = if kind == 21 { 2 } else { 4 };
+        let count = input.len().min(size - self.filled);
+        self.bytes[self.filled..self.filled + count].copy_from_slice(&input[..count]);
+        self.filled += count;
+        *input = &input[count..];
+        if self.filled == size {
+            self.filled = 0;
+            Ok(Some(self.bytes))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl<S> TlsStream<S> {
@@ -97,6 +128,7 @@ impl<S: Read + Write> TlsStream<S> {
             .into());
         }
         let mut empty_records = 0;
+        let mut controls = 0;
         loop {
             if self.offset < self.plain.len() {
                 let n = out.len().min(self.plain.len() - self.offset);
@@ -118,14 +150,45 @@ impl<S: Read + Write> TlsStream<S> {
             }
             let plain = self.read_keys.open(kind, self.version, &body)?;
             match kind {
-                23 => self.plain = plain,
-                21 if plain.as_slice() == [1, 0] => self.received_close = true,
-                21 if plain.len() == 2 => return Err(Error::Alert(plain[1])),
-                // A request to renegotiate has no transcript state. Decline it
-                // rather than silently accepting a new handshake mid-stream.
-                22 if plain.as_slice() == [0, 0, 0, 0] => {
-                    self.send(21, &[1, 100])?;
-                    self.flush()?;
+                23 if self.control.filled != 0 => {
+                    return Err(Error::Protocol(
+                        "application data interrupts TLS control message",
+                    ));
+                }
+                23 if !plain.is_empty() => {
+                    self.plain = plain;
+                    continue;
+                }
+                23 => {}
+                21 | 22 if !plain.is_empty() => {
+                    let mut input = plain.as_slice();
+                    while !input.is_empty() {
+                        if let Some(message) = self.control.consume(kind, &mut input)? {
+                            match (kind, message) {
+                                (21, [1, 0, ..]) => {
+                                    self.received_close = true;
+                                    self.close()?;
+                                    return Ok(0);
+                                }
+                                (21, [1 | 2, code, ..]) => return Err(Error::Alert(code)),
+                                // Decline renegotiation without creating a new transcript.
+                                (22, [0, 0, 0, 0]) => {
+                                    if self.sent_close {
+                                        return Err(Error::Protocol(
+                                            "TLS handshake after close_notify",
+                                        ));
+                                    }
+                                    self.send(21, &[1, 100])?;
+                                    self.flush()?;
+                                }
+                                _ => return Err(Error::Protocol("unexpected TLS control message")),
+                            }
+                            controls += 1;
+                            if controls > 32 {
+                                return Err(Error::Protocol("too many TLS control messages"));
+                            }
+                        }
+                    }
                 }
                 _ => return Err(Error::Protocol("unexpected TLS application record")),
             }
@@ -192,147 +255,5 @@ fn to_io(error: Error) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    fn stream<S>(io: S) -> TlsStream<S> {
-        let keys = || record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
-        TlsStream {
-            io,
-            reader: record::Reader::default(),
-            read_keys: keys(),
-            write_keys: keys(),
-            version: Version::Tls11,
-            suite: CipherSuite::Aes128Sha,
-            session_id: Vec::new(),
-            extended_master_secret: false,
-            encrypt_then_mac: false,
-            plain: Zeroizing::new(Vec::new()),
-            offset: 0,
-            received_close: false,
-            sent_close: false,
-            failed: false,
-        }
-    }
-
-    #[test]
-    fn a_corrupt_record_never_releases_plaintext_and_terminates_the_stream() {
-        let mut keys = record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
-        let mut encrypted = keys
-            .seal(23, Version::Tls11, b"authenticated message")
-            .unwrap();
-        encrypted[0] ^= 1;
-        let mut wire = Vec::new();
-        record::write(&mut wire, 23, Version::Tls11, &encrypted).unwrap();
-        let mut stream = stream(Cursor::new(wire));
-        let mut out = [0x44; 128];
-        assert_eq!(
-            stream.read(&mut out).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(out, [0x44; 128]);
-        assert_eq!(
-            stream.read(&mut out).unwrap_err().kind(),
-            io::ErrorKind::ConnectionAborted
-        );
-        assert!(stream.write_all(b"after failure").is_err());
-        assert!(stream.flush().is_err());
-    }
-
-    #[test]
-    fn short_application_reads_preserve_data_and_close_notify_is_idempotent() {
-        let mut keys = record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
-        let mut wire = Vec::new();
-        for (kind, plain) in [(23, b"hello".as_slice()), (21, &[1, 0])] {
-            let body = keys.seal(kind, Version::Tls11, plain).unwrap();
-            record::write(&mut wire, kind, Version::Tls11, &body).unwrap();
-        }
-        let mut stream = stream(Cursor::new(wire));
-        let mut byte = [0];
-        for expected in b"hello" {
-            assert_eq!(stream.read(&mut byte).unwrap(), 1);
-            assert_eq!(byte[0], *expected);
-        }
-        assert_eq!(stream.read(&mut byte).unwrap(), 0);
-        assert_eq!(stream.read(&mut byte).unwrap(), 0);
-        assert!(stream.write_all(b"closed").is_err());
-    }
-
-    struct PartialWrite {
-        written: Vec<u8>,
-    }
-    impl Read for PartialWrite {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Ok(0)
-        }
-    }
-    impl Write for PartialWrite {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if !self.written.is_empty() {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            self.written.extend_from_slice(&bytes[..3]);
-            Ok(3)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn partial_write_failure_does_not_replay_or_accept_more_plaintext() {
-        let mut stream = stream(PartialWrite {
-            written: Vec::new(),
-        });
-        assert_eq!(
-            stream.write(b"request").unwrap_err().kind(),
-            io::ErrorKind::TimedOut
-        );
-        assert_eq!(
-            stream.write(b"request").unwrap_err().kind(),
-            io::ErrorKind::ConnectionAborted
-        );
-        assert_eq!(stream.get_ref().written.len(), 3);
-    }
-
-    struct FailedFlush {
-        written: Vec<u8>,
-    }
-    impl Read for FailedFlush {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Ok(0)
-        }
-    }
-    impl Write for FailedFlush {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.written.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::ErrorKind::TimedOut.into())
-        }
-    }
-
-    #[test]
-    fn failed_flush_cannot_be_retried_as_a_successful_close() {
-        for close in [false, true] {
-            let mut stream = stream(FailedFlush {
-                written: Vec::new(),
-            });
-            let error = if close {
-                stream.close().unwrap_err()
-            } else {
-                stream.write_all(b"buffered request").unwrap();
-                stream.flush().unwrap_err().into()
-            };
-            assert!(matches!(error, Error::Io(err) if err.kind() == io::ErrorKind::TimedOut));
-            let written = stream.get_ref().written.len();
-            assert!(stream.close().is_err());
-            assert!(stream.write_all(b"more").is_err());
-            assert!(stream.read(&mut [0; 1]).is_err());
-            assert!(stream.flush().is_err());
-            assert_eq!(stream.get_ref().written.len(), written);
-        }
-    }
-}
+#[path = "stream_tests.rs"]
+mod tests;

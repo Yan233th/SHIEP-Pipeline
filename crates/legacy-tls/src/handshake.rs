@@ -160,6 +160,7 @@ pub(crate) fn connect<S: Read + Write>(
         received_close: false,
         sent_close: false,
         failed: false,
+        control: crate::stream::Control::default(),
     })
 }
 
@@ -335,7 +336,6 @@ impl Messages {
         version: Option<Version>,
         mut keys: Option<&mut record::Keys>,
     ) -> Result<Vec<u8>, Error> {
-        let mut empty = 0;
         loop {
             if self.pending.len() >= 4 {
                 let len = u32::from_be_bytes([0, self.pending[1], self.pending[2], self.pending[3]])
@@ -369,15 +369,12 @@ impl Messages {
             if kind != 22 {
                 return Err(Error::Protocol("unexpected TLS handshake record"));
             }
+            if plain.is_empty() {
+                return Err(Error::Protocol("empty TLS handshake record"));
+            }
             self.total += plain.len();
             if self.total > 4 * MAX_HANDSHAKE {
                 return Err(Error::Protocol("TLS handshake too large"));
-            }
-            if plain.is_empty() {
-                empty += 1;
-            }
-            if empty > 32 {
-                return Err(Error::Protocol("too many empty TLS records"));
             }
             self.pending.extend_from_slice(&plain);
         }

@@ -119,3 +119,68 @@ fn cbc_compression_work_does_not_depend_on_decrypted_padding() {
         }
     }
 }
+
+#[test]
+#[ignore = "manual release-mode timing diagnostic; host noise prevents a CI threshold"]
+#[allow(clippy::assertions_on_constants)] // Runtime guard for an explicitly selected diagnostic.
+fn cbc_rejection_timing() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    assert!(!cfg!(debug_assertions), "run with --release");
+    #[derive(Default, Clone, Copy)]
+    struct Samples {
+        count: f64,
+        mean: f64,
+        m2: f64,
+    }
+    impl Samples {
+        fn push(&mut self, sample: f64) {
+            self.count += 1.0;
+            let delta = sample - self.mean;
+            self.mean += delta / self.count;
+            self.m2 += delta * (sample - self.mean);
+        }
+        fn variance_of_mean(self) -> f64 {
+            self.m2 / (self.count - 1.0) / self.count
+        }
+    }
+
+    for size in [48, 256, 512] {
+        // Both classes must fail; only the padding validity differs. Comparing
+        // accepted vs rejected records would measure the public return path.
+        let mut bad_mac = vec![0; size];
+        bad_mac[size - 12..].fill(11);
+        let mut bad_padding = bad_mac.clone();
+        bad_padding[size - 1] ^= 1;
+        let inputs = [bad_mac, bad_padding];
+        let mut samples = [Samples::default(); 2];
+        let mut state = 0xb427_0159u32;
+        for iteration in 0..101_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let class = (state & 1) as usize;
+            let input = black_box(inputs[class].as_slice());
+            let start = Instant::now();
+            let result = black_box(verify_cbc_mac(
+                black_box(&[9; 20]),
+                0,
+                23,
+                Version::Tls11,
+                input,
+            ));
+            let elapsed = start.elapsed().as_nanos() as f64;
+            assert!(matches!(result, Err(Error::BadRecordMac)));
+            if iteration >= 1_000 {
+                samples[class].push(elapsed);
+            }
+        }
+        let [a, b] = samples;
+        let t = (a.mean - b.mean) / (a.variance_of_mean() + b.variance_of_mean()).sqrt();
+        eprintln!(
+            "CBC {size} bytes: bad MAC {:.0} ns, bad padding {:.0} ns; Welch t {t:.2}; samples {:.0}/{:.0}",
+            a.mean, b.mean, a.count, b.count
+        );
+    }
+}

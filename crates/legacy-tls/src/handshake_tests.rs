@@ -92,3 +92,119 @@ fn sni_rejects_ip_literals_controls_and_invalid_dns_labels() {
     config.server_name = Some("xn--example-9d0b.test".to_string());
     assert!(validate(&config).is_ok());
 }
+
+#[test]
+fn handshake_record_fragments_reassemble_at_every_boundary() {
+    let mut extensions = Vec::new();
+    extension(&mut extensions, 23, &[]).unwrap();
+    let expected = message(2, &hello(&extensions)).unwrap();
+    for boundary in 1..expected.len() {
+        let mut wire = Vec::new();
+        for fragment in [&expected[..boundary], &expected[boundary..]] {
+            record::write(&mut wire, 22, Version::Tls12, fragment).unwrap();
+        }
+        let mut reader = record::Reader::default();
+        let mut messages = Messages::default();
+        assert_eq!(
+            messages
+                .next(&mut reader, &mut wire.as_slice(), None, None)
+                .unwrap(),
+            expected
+        );
+        assert!(messages.pending.is_empty());
+    }
+}
+
+#[test]
+fn empty_oversized_and_out_of_order_handshake_records_are_rejected() {
+    for (kind, body) in [
+        (22, &b""[..]),
+        (22, &[11, 255, 255, 255]),
+        (20, &[1]),
+        (23, b"data"),
+    ] {
+        let mut wire = Vec::new();
+        record::write(&mut wire, kind, Version::Tls12, body).unwrap();
+        assert!(
+            Messages::default()
+                .next(
+                    &mut record::Reader::default(),
+                    &mut wire.as_slice(),
+                    None,
+                    None
+                )
+                .is_err()
+        );
+    }
+}
+
+struct Reply(std::io::Cursor<Vec<u8>>);
+impl Read for Reply {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(bytes)
+    }
+}
+impl Write for Reply {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn mutated_and_truncated_server_flights_never_panic_or_establish_a_stream() {
+    let mut extensions = Vec::new();
+    extension(&mut extensions, 23, &[]).unwrap();
+    let mut wire = Vec::new();
+    record::write(
+        &mut wire,
+        22,
+        Version::Tls12,
+        &message(2, &hello(&extensions)).unwrap(),
+    )
+    .unwrap();
+    record::write(
+        &mut wire,
+        22,
+        Version::Tls12,
+        &message(11, &[0, 0, 5, 0, 0, 2, 0x30, 0]).unwrap(),
+    )
+    .unwrap();
+    record::write(&mut wire, 22, Version::Tls12, &message(14, &[]).unwrap()).unwrap();
+    let cfg = config();
+    for end in 0..=wire.len() {
+        assert!(
+            cfg.connect(Reply(std::io::Cursor::new(wire[..end].to_vec())))
+                .is_err()
+        );
+    }
+    for offset in 0..wire.len() {
+        for value in 0..=255 {
+            let mut mutated = wire.clone();
+            mutated[offset] = value;
+            assert!(cfg.connect(Reply(std::io::Cursor::new(mutated))).is_err());
+        }
+    }
+    // Reproducible input mutations; this is not protocol randomness.
+    let mut state = 0x78b4_ef2c_3816_9031u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..4096 {
+        let mut bytes = vec![0; (next() as usize % 512) + 1];
+        for byte in &mut bytes {
+            *byte = next() as u8;
+        }
+        if bytes.len() >= 5 {
+            bytes[..3].copy_from_slice(&[22, 3, 3]);
+            let len = (bytes.len() - 5) as u16;
+            bytes[3..5].copy_from_slice(&len.to_be_bytes());
+        }
+        assert!(cfg.connect(Reply(std::io::Cursor::new(bytes))).is_err());
+    }
+}
