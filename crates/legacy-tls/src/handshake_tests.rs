@@ -69,3 +69,26 @@ fn malformed_certificate_vectors_fail_without_panics() {
         assert!(certificates(input).is_err());
     }
 }
+
+#[test]
+fn sni_rejects_ip_literals_controls_and_invalid_dns_labels() {
+    for name in [
+        "",
+        "127.0.0.1",
+        "::1",
+        "a..test",
+        "-a.test",
+        "a-.test",
+        "a\n.test",
+        "a\0.test",
+    ] {
+        let mut config = config();
+        config.server_name = Some(name.to_string());
+        assert!(validate(&config).is_err(), "{name:?}");
+    }
+    let mut config = config();
+    config.server_name = Some(format!("{}.test", "a".repeat(64)));
+    assert!(validate(&config).is_err());
+    config.server_name = Some("xn--example-9d0b.test".to_string());
+    assert!(validate(&config).is_ok());
+}

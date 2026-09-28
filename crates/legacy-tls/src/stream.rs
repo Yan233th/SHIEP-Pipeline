@@ -79,8 +79,8 @@ impl<S: Read + Write> TlsStream<S> {
     pub fn close(&mut self) -> Result<(), Error> {
         if !self.sent_close {
             self.send(21, &[1, 0])?;
+            self.flush()?;
             self.sent_close = true;
-            self.io.flush()?;
         }
         Ok(())
     }
@@ -123,7 +123,10 @@ impl<S: Read + Write> TlsStream<S> {
                 21 if plain.len() == 2 => return Err(Error::Alert(plain[1])),
                 // A request to renegotiate has no transcript state. Decline it
                 // rather than silently accepting a new handshake mid-stream.
-                22 if plain.as_slice() == [0, 0, 0, 0] => self.send(21, &[1, 100])?,
+                22 if plain.as_slice() == [0, 0, 0, 0] => {
+                    self.send(21, &[1, 100])?;
+                    self.flush()?;
+                }
                 _ => return Err(Error::Protocol("unexpected TLS application record")),
             }
             empty_records += 1;
@@ -167,7 +170,17 @@ impl<S: Read + Write> Write for TlsStream<S> {
         Ok(len)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.io.flush()
+        if self.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "TLS connection has failed",
+            ));
+        }
+        let result = self.io.flush();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
     }
 }
 
@@ -224,6 +237,7 @@ mod tests {
             io::ErrorKind::ConnectionAborted
         );
         assert!(stream.write_all(b"after failure").is_err());
+        assert!(stream.flush().is_err());
     }
 
     #[test]
@@ -280,5 +294,45 @@ mod tests {
             io::ErrorKind::ConnectionAborted
         );
         assert_eq!(stream.get_ref().written.len(), 3);
+    }
+
+    struct FailedFlush {
+        written: Vec<u8>,
+    }
+    impl Read for FailedFlush {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for FailedFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    #[test]
+    fn failed_flush_cannot_be_retried_as_a_successful_close() {
+        for close in [false, true] {
+            let mut stream = stream(FailedFlush {
+                written: Vec::new(),
+            });
+            let error = if close {
+                stream.close().unwrap_err()
+            } else {
+                stream.write_all(b"buffered request").unwrap();
+                stream.flush().unwrap_err().into()
+            };
+            assert!(matches!(error, Error::Io(err) if err.kind() == io::ErrorKind::TimedOut));
+            let written = stream.get_ref().written.len();
+            assert!(stream.close().is_err());
+            assert!(stream.write_all(b"more").is_err());
+            assert!(stream.read(&mut [0; 1]).is_err());
+            assert!(stream.flush().is_err());
+            assert_eq!(stream.get_ref().written.len(), written);
+        }
     }
 }

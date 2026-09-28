@@ -8,7 +8,7 @@ use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
-use openssl::ssl::{Ssl, SslContext, SslMethod, SslOptions, SslVersion};
+use openssl::ssl::{NameType, Ssl, SslContext, SslMethod, SslOptions, SslVersion};
 use openssl::x509::{X509, X509NameBuilder};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -89,6 +89,10 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
                 let server = thread::spawn(move || {
                     let mut stream = Ssl::new(&context).unwrap().accept(server).unwrap();
                     assert!(!stream.ssl().session_reused());
+                    assert_eq!(
+                        stream.ssl().servername(NameType::HOST_NAME),
+                        Some("legacy.example.test")
+                    );
                     let mut received = vec![0; expected.len()];
                     stream.read_exact(&mut received).unwrap();
                     assert_eq!(received, expected);
@@ -98,6 +102,7 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
                 let mut config = ClientConfig::new(Arc::new(NoCertificateVerification));
                 config.min_version = version;
                 config.max_version = version;
+                config.server_name = Some("legacy.example.test".into());
                 if marker {
                     config.session_id = [b"L3IP".as_slice(), &[0; 28]].concat();
                 }
@@ -150,5 +155,70 @@ fn raw_eof_is_not_reported_as_clean_tls_shutdown() {
         .unwrap();
     let error = stream.read(&mut [0; 1]).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    server.join().unwrap();
+}
+
+// Alter the native server's first encrypted handshake record, after its CCS.
+// The client must authenticate Finished before returning an established stream.
+#[derive(Debug)]
+struct TamperedFinished {
+    io: TcpStream,
+    pending: Vec<u8>,
+    encrypted: bool,
+    altered: bool,
+}
+
+impl Read for TamperedFinished {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.io.read(out)
+    }
+}
+
+impl Write for TamperedFinished {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        while self.pending.len() >= 5 {
+            let len = usize::from(u16::from_be_bytes([self.pending[3], self.pending[4]])) + 5;
+            if self.pending.len() < len {
+                break;
+            }
+            let mut record: Vec<u8> = self.pending.drain(..len).collect();
+            if record[0] == 22 && self.encrypted && !self.altered {
+                record[len - 1] ^= 1;
+                self.altered = true;
+            }
+            if record[0] == 20 {
+                self.encrypted = true;
+            }
+            self.io.write_all(&record)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.io.flush()
+    }
+}
+
+#[test]
+fn tampered_server_finished_never_establishes_a_connection() {
+    let context = context(SslVersion::TLS1_2, "AES128-SHA");
+    let (client, server) = sockets();
+    let server = thread::spawn(move || {
+        let stream = Ssl::new(&context)
+            .unwrap()
+            .accept(TamperedFinished {
+                io: server,
+                pending: Vec::new(),
+                encrypted: false,
+                altered: false,
+            })
+            .unwrap();
+        assert!(stream.get_ref().altered);
+    });
+    assert!(matches!(
+        ClientConfig::new(Arc::new(NoCertificateVerification)).connect(client),
+        Err(Error::BadRecordMac)
+    ));
     server.join().unwrap();
 }

@@ -15,7 +15,8 @@ TLS compression, renegotiation, client certificates, SSL, TLS 1.0, or TLS 1.3.
 Certificate policy is explicit: `ClientConfig::new` requires a
 `CertificateVerifier`. No authentication policy is chosen implicitly. The
 `danger::NoCertificateVerification` policy is available only as a deliberate
-opt-out. Keys must be RSA, 2048 to 8192 bits.
+opt-out. Keys must be RSA, 2048 to 4096 bits. A verifier using PKI must also
+enforce server-authentication and key-encipherment certificate usage.
 
 The crate creates no threads, timers, sockets, or polling loops. Pass a blocking
 `Read + Write` transport and configure its timeouts before connecting. Reads

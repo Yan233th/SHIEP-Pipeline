@@ -103,3 +103,19 @@ fn all_invalid_padding_values_have_the_same_mac_error() {
         ));
     }
 }
+
+#[test]
+fn cbc_compression_work_does_not_depend_on_decrypted_padding() {
+    for size in [32, 64, 256, 512, 16_416] {
+        let mut data = vec![0; size];
+        let mut expected = None;
+        for padding_byte in 0..=255 {
+            data[size - 1] = padding_byte;
+            COMPRESSIONS.with(|count| count.set(0));
+            let _ = verify_cbc_mac(&[0; 20], 0, 23, Version::Tls11, &data);
+            let actual = COMPRESSIONS.with(|count| count.get());
+            assert!(actual > 0);
+            assert_eq!(actual, *expected.get_or_insert(actual));
+        }
+    }
+}

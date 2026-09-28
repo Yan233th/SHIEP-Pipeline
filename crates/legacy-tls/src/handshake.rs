@@ -44,7 +44,7 @@ pub(crate) fn connect<S: Read + Write>(
         .to_der()
         .map_err(|_| Error::Certificate)?;
     let public_key = RsaPublicKey::from_public_key_der(&spki).map_err(|_| Error::Certificate)?;
-    if !(2048..=8192).contains(&public_key.n().bits()) {
+    if !(2048..=RsaPublicKey::MAX_SIZE).contains(&public_key.n().bits()) {
         return Err(Error::Protocol("unsupported RSA certificate key size"));
     }
     transcript.update(&certs);
@@ -174,7 +174,19 @@ fn validate(config: &ClientConfig) -> Result<(), Error> {
         return Err(Error::Protocol("invalid TLS cipher list"));
     }
     if let Some(name) = &config.server_name {
-        if name.is_empty() || name.len() > 253 || !name.is_ascii() || name.as_bytes().contains(&0) {
+        if name.is_empty()
+            || name.len() > 253
+            || name.parse::<std::net::IpAddr>().is_ok()
+            || !name.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
             return Err(Error::Protocol("invalid TLS server name"));
         }
     }

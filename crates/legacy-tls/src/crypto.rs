@@ -115,7 +115,14 @@ fn header(seq: u64, kind: u8, version: Version, len: usize) -> [u8; 13] {
 
 const SHA1_INITIAL: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
 
+#[cfg(test)]
+std::thread_local! {
+    static COMPRESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
+    #[cfg(test)]
+    COMPRESSIONS.with(|count| count.set(count.get() + 1));
     sha1::compress(state, &[(*block).into()]);
 }
 
