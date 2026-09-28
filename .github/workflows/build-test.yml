@@ -20,15 +20,12 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             target_label: linux-x64
-            suffix: ''
           - os: macos-latest
             target: aarch64-apple-darwin
             target_label: macos-arm64
-            suffix: ''
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             target_label: windows-x64
-            suffix: .exe
 
     steps:
       - name: Checkout
@@ -58,12 +55,30 @@ jobs:
           SHIEP_PIPELINE_VERSION: test-${{ steps.checkout.outputs.commit }}
         run: cargo +stable run --locked --release -p ec-cli --target ${{ matrix.target }} -- --version
 
-      - name: Upload test binaries
+      - name: Package test binaries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >-
+          tar -czf SHIEP-Pipeline-${{ matrix.target_label }}.tar.gz
+          -C target/${{ matrix.target }}
+          debug/SHIEP-Pipeline release/SHIEP-Pipeline
+
+      - name: Upload test binaries (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v7
+        with:
+          path: SHIEP-Pipeline-${{ matrix.target_label }}.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test binaries (Windows)
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: SHIEP-Pipeline-${{ matrix.target_label }}
           path: |
-            target/${{ matrix.target }}/debug/SHIEP-Pipeline${{ matrix.suffix }}
-            target/${{ matrix.target }}/release/SHIEP-Pipeline${{ matrix.suffix }}
+            target/${{ matrix.target }}/debug/SHIEP-Pipeline.exe
+            target/${{ matrix.target }}/release/SHIEP-Pipeline.exe
           if-no-files-found: error
           retention-days: 14

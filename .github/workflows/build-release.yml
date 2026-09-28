@@ -33,36 +33,40 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust (official rustup)
+        run: rustup toolchain install stable --profile minimal --no-self-update --target ${{ matrix.target }}
+
+      - name: Toolchain versions
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update --target "${{ matrix.target }}"
           rustc +stable -V
           cargo +stable -V
 
       - name: Build binary
         run: cargo +stable build --locked --release -p ec-cli --target ${{ matrix.target }}
 
-      - name: Prepare artifact (Unix)
+      - name: Upload release binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          OUT="${BIN_NAME}-${VERSION}-${{ matrix.target_label }}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${OUT}"
-
-      - name: Prepare artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $Out = "$env:BIN_NAME-$env:VERSION-${{ matrix.target_label }}.exe"
-          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" "dist/$Out"
-
-      - name: Upload to release (GitHub CLI)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+          set -euo pipefail
+          mkdir -p dist
+          OUT="dist/${BIN_NAME}-${VERSION}-${{ matrix.target_label }}"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$OUT"
+          gh release upload "$VERSION" "$OUT" --clobber
+
+      - name: Upload release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $Out = "dist/$env:BIN_NAME-$env:VERSION-${{ matrix.target_label }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" $Out
+          gh release upload "$env:VERSION" $Out --clobber
