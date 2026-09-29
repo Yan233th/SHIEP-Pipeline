@@ -410,36 +410,27 @@ fn relay_direct_with_reply(
 }
 
 pub(crate) fn relay_tunnel(
-    mut client: TcpStream,
+    client: TcpStream,
     conn: crate::netstack::TunnelTcpConnection,
 ) -> EcResult<()> {
     let (sender, rx) = conn.into_parts();
-    let c_to_r_src = client
-        .try_clone()
-        .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;
-
-    let uplink = thread::spawn(move || relay_client_to_tunnel(c_to_r_src, sender));
-    let downlink = relay_tunnel_to_client(&mut client, rx);
-
-    join_relay_worker(uplink, "uplink").and(downlink)
+    thread::scope(|scope| {
+        let uplink = scope.spawn(|| relay_client_to_tunnel(&client, sender));
+        let downlink = relay_tunnel_to_client(&client, rx);
+        relay_worker_result(uplink.join(), "uplink").and(downlink)
+    })
 }
 
 fn relay_direct(client: TcpStream, upstream: TcpStream) -> EcResult<()> {
-    let client_reader = client
-        .try_clone()
-        .map_err(|e| EcError::Runtime(format!("clone client stream failed: {e}")))?;
-    let upstream_reader = upstream
-        .try_clone()
-        .map_err(|e| EcError::Runtime(format!("clone upstream stream failed: {e}")))?;
-
-    let uplink = thread::spawn(move || pump_stream(client_reader, upstream, "client to upstream"));
-    let downlink = pump_stream(upstream_reader, client, "upstream to client");
-
-    join_relay_worker(uplink, "uplink").and(downlink)
+    thread::scope(|scope| {
+        let uplink = scope.spawn(|| pump_stream(&client, &upstream, "client to upstream"));
+        let downlink = pump_stream(&upstream, &client, "upstream to client");
+        relay_worker_result(uplink.join(), "uplink").and(downlink)
+    })
 }
 
 fn relay_client_to_tunnel(
-    mut client: TcpStream,
+    mut client: &TcpStream,
     sender: crate::netstack::TunnelTcpSender,
 ) -> EcResult<()> {
     let mut buf = [0u8; TUNNEL_UPLOAD_BUFFER_SIZE];
@@ -448,12 +439,12 @@ fn relay_client_to_tunnel(
             Ok(0) => return sender.close(),
             Ok(n) => {
                 if let Err(err) = sender.send(buf[..n].to_vec()) {
-                    let _ = client.shutdown(Shutdown::Both);
+                    abort_stream(client);
                     return Err(err);
                 }
             }
             Err(err) => {
-                let _ = client.shutdown(Shutdown::Both);
+                abort_stream(client);
                 return relay_io_result(err, "client to tunnel read");
             }
         }
@@ -461,7 +452,7 @@ fn relay_client_to_tunnel(
 }
 
 fn relay_tunnel_to_client(
-    client: &mut TcpStream,
+    mut client: &TcpStream,
     mut rx: crate::netstack::TunnelTcpReceiver,
 ) -> EcResult<()> {
     loop {
@@ -473,37 +464,37 @@ fn relay_tunnel_to_client(
             }
             Ok(crate::netstack::TunnelTcpRead::Closed) => return Ok(()),
             Err(err) => {
-                let _ = client.shutdown(Shutdown::Both);
+                abort_stream(client);
                 return Err(err);
             }
         };
         if let Err(err) = client.write_all(&chunk) {
-            let _ = client.shutdown(Shutdown::Both);
+            abort_stream(client);
             return relay_io_result(err, "tunnel to client write");
         }
     }
 }
 
-fn pump_stream(mut src: TcpStream, mut dst: TcpStream, direction: &'static str) -> EcResult<()> {
+fn pump_stream(mut src: &TcpStream, mut dst: &TcpStream, direction: &'static str) -> EcResult<()> {
     let mut buf = [0u8; RELAY_BUFFER_SIZE];
     let result = loop {
         match src.read(&mut buf) {
             Ok(0) => break Ok(()),
             Ok(n) => {
                 if let Err(err) = dst.write_all(&buf[..n]) {
-                    let _ = src.shutdown(Shutdown::Both);
-                    let _ = dst.shutdown(Shutdown::Both);
+                    abort_stream(src);
+                    abort_stream(dst);
                     break relay_io_result(err, &format!("{direction} write"));
                 }
             }
             Err(err) => {
-                let _ = src.shutdown(Shutdown::Both);
-                let _ = dst.shutdown(Shutdown::Both);
+                abort_stream(src);
+                abort_stream(dst);
                 break relay_io_result(err, &format!("{direction} read"));
             }
         }
     };
-    let shutdown_result = shutdown_write(&dst, direction);
+    let shutdown_result = shutdown_write(dst, direction);
     result.and(shutdown_result)
 }
 
@@ -525,16 +516,36 @@ fn shutdown_write(stream: &TcpStream, peer: &str) -> EcResult<()> {
     }
 }
 
-fn join_relay_worker(
-    worker: thread::JoinHandle<EcResult<()>>,
+fn abort_stream(stream: &TcpStream) {
+    // Both relay directions borrow this same handle so cancellation reaches
+    // the opposite worker even on Windows, where shutdown alone cannot wake it.
+    // Prevent new I/O before canceling operations already waiting on this handle.
+    let _ = stream.shutdown(Shutdown::Both);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::{Foundation::HANDLE, System::IO::CancelIoEx};
+
+        // SAFETY: the borrowed stream keeps this socket handle alive. A null
+        // OVERLAPPED cancels all pending I/O; it does not close the socket.
+        unsafe {
+            let _ = CancelIoEx(stream.as_raw_socket() as HANDLE, std::ptr::null());
+        }
+    }
+}
+
+fn relay_worker_result(
+    result: thread::Result<EcResult<()>>,
     direction: &'static str,
 ) -> EcResult<()> {
-    worker
-        .join()
-        .map_err(|_| EcError::Runtime(format!("{direction} relay worker panicked")))?
+    result.map_err(|_| EcError::Runtime(format!("{direction} relay worker panicked")))?
 }
 
 fn is_expected_relay_io_error(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32) {
+        return true;
+    }
     matches!(
         err.kind(),
         ErrorKind::BrokenPipe
@@ -588,9 +599,8 @@ mod tests {
     use super::{
         ClientFailure, RouteDecision, RouteTransport, SOCKS_REP_GENERAL_FAILURE,
         SOCKS_REP_SUCCEEDED, describe_route_source, execute_route, handle_client,
-        is_expected_relay_io_error, is_retryable_accept_error, join_relay_worker,
-        normalize_bind_addr, relay_direct, route_decision_planner_error, route_decision_remote,
-        target_addr,
+        is_expected_relay_io_error, is_retryable_accept_error, normalize_bind_addr, relay_direct,
+        relay_worker_result, route_decision_planner_error, route_decision_remote, target_addr,
     };
     use crate::error::EcError;
     use crate::route_table::RouteTable;
@@ -1014,7 +1024,7 @@ mod tests {
             panic!("relay test panic");
         });
 
-        let err = join_relay_worker(worker, "uplink").unwrap_err();
+        let err = relay_worker_result(worker.join(), "uplink").unwrap_err();
         assert_eq!(
             crate::error::concise_error(err),
             "uplink relay worker panicked"
@@ -1058,13 +1068,26 @@ mod tests {
 
     #[test]
     fn relay_reset_wakes_the_opposite_direction() {
-        for reset_client in [false, true] {
-            let (client, relay_client) = tcp_pair();
-            let (server, relay_upstream) = tcp_pair();
+        for (reset_client, after_transfer) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (mut client, relay_client) = tcp_pair();
+            let (mut server, relay_upstream) = tcp_pair();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let relay = thread::spawn(move || {
                 let _ = done_tx.send(relay_direct(relay_client, relay_upstream));
             });
+            if after_transfer {
+                // Exercise teardown after both relay directions have handled I/O.
+                client.write_all(b"request").unwrap();
+                let mut request = [0u8; 7];
+                server.read_exact(&mut request).unwrap();
+                assert_eq!(&request, b"request");
+                server.write_all(b"reply").unwrap();
+                let mut reply = [0u8; 5];
+                client.read_exact(&mut reply).unwrap();
+                assert_eq!(&reply, b"reply");
+            }
             let (reset_peer, mut remaining_peer) = if reset_client {
                 (client, server)
             } else {
@@ -1076,14 +1099,35 @@ mod tests {
             drop(reset_peer);
             let mut data = Vec::new();
             remaining_peer.read_to_end(&mut data).unwrap();
+            assert!(data.is_empty());
+            let result = done_rx.recv_timeout(Duration::from_secs(2));
             assert!(
-                done_rx
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap()
-                    .is_ok()
+                matches!(result, Ok(Ok(()))),
+                "relay did not stop: reset_client={reset_client}, after_transfer={after_transfer}, result={result:?}"
             );
             relay.join().unwrap();
         }
+    }
+
+    #[test]
+    fn abort_stream_disallows_further_io() {
+        let (_peer, mut stream) = tcp_pair();
+        super::abort_stream(&stream);
+        assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        let err = stream.write(b"after abort").unwrap_err();
+        assert!(is_expected_relay_io_error(&err), "{err:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canceled_socket_io_is_expected_relay_teardown() {
+        let err = std::io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
+        );
+        assert!(is_expected_relay_io_error(&err));
+        assert!(!is_expected_relay_io_error(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
     }
 
     #[test]
