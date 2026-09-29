@@ -396,6 +396,7 @@ mod tests {
     };
     use std::io::{Read, Write};
     use std::net::{Ipv6Addr, TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -403,17 +404,41 @@ mod tests {
     const TEST_TARGET_HOST: &str = "fallback.test";
     const TEST_TARGET_PORT: u16 = 443;
 
-    fn spawn_test_proxy<F>(handler: F) -> (String, thread::JoinHandle<()>)
+    struct TestProxyWorker {
+        worker: thread::JoinHandle<()>,
+        done: mpsc::Receiver<()>,
+    }
+
+    impl TestProxyWorker {
+        fn join(self) -> thread::Result<()> {
+            match self.done.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => self.worker.join(),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("test proxy did not finish within 5s")
+                }
+            }
+        }
+    }
+
+    fn spawn_test_proxy<F>(handler: F) -> (String, TestProxyWorker)
     where
         F: FnOnce(TcpStream) + Send + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (done_tx, done) = mpsc::channel();
         let worker = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             handler(stream);
+            let _ = done_tx.send(());
         });
-        (addr.to_string(), worker)
+        (addr.to_string(), TestProxyWorker { worker, done })
     }
 
     fn wait_for_peer_close(stream: &mut TcpStream) {
