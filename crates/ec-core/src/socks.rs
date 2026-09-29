@@ -543,8 +543,13 @@ fn relay_worker_result(
 
 fn is_expected_relay_io_error(err: &std::io::Error) -> bool {
     #[cfg(windows)]
-    if err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32) {
-        return true;
+    {
+        use windows_sys::Win32::Networking::WinSock::{WSA_OPERATION_ABORTED, WSAEINTR};
+
+        // Cancellation can surface through either blocking Winsock or overlapped I/O.
+        if matches!(err.raw_os_error(), Some(WSAEINTR | WSA_OPERATION_ABORTED)) {
+            return true;
+        }
     }
     matches!(
         err.kind(),
@@ -1101,7 +1106,7 @@ mod tests {
             let result = done_rx.recv_timeout(Duration::from_secs(2));
             assert!(
                 matches!(result, Ok(Ok(()))),
-                "relay did not stop: reset_client={reset_client}, after_transfer={after_transfer}, result={result:?}"
+                "relay teardown failed: reset_client={reset_client}, after_transfer={after_transfer}, result={result:?}"
             );
             relay.join().unwrap();
         }
@@ -1119,10 +1124,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn canceled_socket_io_is_expected_relay_teardown() {
-        let err = std::io::Error::from_raw_os_error(
-            windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32,
-        );
-        assert!(is_expected_relay_io_error(&err));
+        use windows_sys::Win32::Networking::WinSock::{
+            WSA_OPERATION_ABORTED, WSAEACCES, WSAEINTR, WSAETIMEDOUT,
+        };
+
+        for code in [WSAEINTR, WSA_OPERATION_ABORTED] {
+            let err = std::io::Error::from_raw_os_error(code);
+            assert!(super::relay_io_result(err, "relay read").is_ok(), "{code}");
+        }
+        for code in [WSAETIMEDOUT, WSAEACCES] {
+            let err = std::io::Error::from_raw_os_error(code);
+            assert!(super::relay_io_result(err, "relay read").is_err(), "{code}");
+        }
         assert!(!is_expected_relay_io_error(&std::io::Error::from(
             std::io::ErrorKind::TimedOut
         )));
