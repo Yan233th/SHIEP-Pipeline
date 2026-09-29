@@ -10,10 +10,9 @@ const TX_HEARTBEAT_ICMP_ID: [u8; 2] = [0x55, 0x55];
 const TX_HEARTBEAT_ICMP_SEQ: [u8; 2] = [0x44, 0x33];
 const TX_HEARTBEAT_PAYLOAD_PREFIX: &[u8; 18] = b"SANGFORSCSIPCLIENT";
 const TX_HEARTBEAT_PAYLOAD_SUFFIX: &[u8; 6] = b"L3VPN\0";
-const NATIVE_CONTROL_FRAME_LEN: usize = 0x28;
-const NATIVE_CONTROL_MAGIC: &[u8; 4] = b"AABB";
+pub(crate) const NATIVE_CONTROL_FRAME_LEN: usize = 0x28;
+pub(crate) const NATIVE_CONTROL_MAGIC: &[u8; 4] = b"AABB";
 pub(crate) const SEND_IP_REPLY_MIN_LEN: usize = 16;
-pub(crate) const SEND_IP_REPLY_EXPECTED_LEN: usize = 36;
 pub(crate) const COMMAND_REPLY_BODY_EXPECTED_LEN: usize = 36;
 const COMMAND_REPLY_MIN_LEN: usize = 4;
 

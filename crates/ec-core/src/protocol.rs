@@ -3,10 +3,10 @@ use crate::error::{EcError, EcResult};
 use crate::output::{self, Scope};
 use crate::protocol_wire::{
     COMMAND_REPLY_BODY_EXPECTED_LEN, HEARTBEAT_OPAQUE_TAIL_LEN, HEARTBEAT_SESSION_LEN,
-    NativeControlType, PROTOCOL_TOKEN_LEN, SEND_IP_REPLY_EXPECTED_LEN, SendIpReply,
-    build_command_message, build_initial_query_ip_message, build_stream_handshake_message,
-    build_tx_heartbeat_packet, parse_command_control_reply, parse_native_control_frame,
-    parse_protocol_token, parse_send_ip_reply,
+    NATIVE_CONTROL_FRAME_LEN, NATIVE_CONTROL_MAGIC, NativeControlType, PROTOCOL_TOKEN_LEN,
+    SendIpReply, build_command_message, build_initial_query_ip_message,
+    build_stream_handshake_message, build_tx_heartbeat_packet, parse_command_control_reply,
+    parse_native_control_frame, parse_protocol_token, parse_send_ip_reply,
 };
 use legacy_tls::TlsStream;
 use std::io::{ErrorKind, Read, Write};
@@ -392,28 +392,18 @@ fn open_command_stream_once(
         .write_all(&message)
         .map_err(|e| EcError::Runtime(format!("SEND_IP write failed: {e}")))?;
 
-    let mut reply = [0u8; 0x80];
-    let total = read_at_least(
-        &mut stream,
-        &mut reply,
-        SEND_IP_REPLY_EXPECTED_LEN,
-        QUERY_IP_REPLY_TIMEOUT,
-    )
-    .map_err(|e| {
-        EcError::Runtime(format!(
-            "SEND_IP read failed: {}",
-            crate::error::concise_error(e)
-        ))
-    })?;
+    let mut reader = ControlReplyReader::default();
+    let reply = reader
+        .read(&mut stream, QUERY_IP_REPLY_TIMEOUT)
+        .map_err(|e| {
+            EcError::Runtime(format!(
+                "SEND_IP read failed: {}",
+                crate::error::concise_error(e)
+            ))
+        })?;
 
-    if total == 0 {
-        return Err(EcError::Runtime(
-            "SEND_IP reply is empty or timed out".to_string(),
-        ));
-    }
-
-    let send_ip = parse_send_ip_reply(&reply[..total]).inspect_err(|_| {
-        debug_protocol_hex("debug: SEND_IP raw reply", &reply[..total]);
+    let send_ip = parse_send_ip_reply(reply).inspect_err(|_| {
+        debug_protocol_hex("debug: SEND_IP raw reply", reply);
     })?;
     hold_command_stream(stream)?;
     Ok(send_ip.into())
@@ -560,18 +550,16 @@ fn open_data_stream(
         )))
     })?;
 
-    let mut reply = [0u8; 1500];
-    let n = read_stream_once(&mut stream, &mut reply, STREAM_HANDSHAKE_TIMEOUT)
-        .map_err(StreamOpenError::retryable)?;
-    if n == 0 {
-        let op = format!("0x{op_code:02x}");
-        return Err(StreamOpenError::retryable(EcError::Runtime(format!(
-            "{} stream handshake reply is empty or timed out; op: {}",
-            profile.label(),
-            op,
-        ))));
-    }
-    validate_stream_ack(profile, kind, op_code, expected_ack, &reply[..n])?;
+    let mut reader = ControlReplyReader::default();
+    let reply = reader
+        .read(&mut stream, STREAM_HANDSHAKE_TIMEOUT)
+        .map_err(|e| {
+            StreamOpenError::retryable(EcError::Runtime(format!(
+                "{} stream handshake read failed: {e}; op: 0x{op_code:02x}",
+                profile.label(),
+            )))
+        })?;
+    validate_stream_ack(profile, kind, op_code, expected_ack, reply)?;
 
     clear_data_stream_read_timeout(&stream, profile).map_err(StreamOpenError::retryable)?;
     Ok(stream)
@@ -621,10 +609,6 @@ fn classify_stream_ack_reply(reply: &[u8], expected_ack: NativeControlType) -> S
         };
     }
 
-    if legacy_stream_ack_matches(reply, expected_ack) {
-        return StreamAckReply::Expected;
-    }
-
     if reply.len() == COMMAND_REPLY_BODY_EXPECTED_LEN
         && let Ok(control) = parse_command_control_reply(reply)
     {
@@ -636,10 +620,6 @@ fn classify_stream_ack_reply(reply: &[u8], expected_ack: NativeControlType) -> S
     }
 
     StreamAckReply::NonControl
-}
-
-fn legacy_stream_ack_matches(reply: &[u8], expected_ack: NativeControlType) -> bool {
-    reply.first().copied() == u8::try_from(expected_ack.code()).ok()
 }
 
 fn is_terminal_stream_control(control: NativeControlType) -> bool {
@@ -825,6 +805,7 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
 fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
     let mut failure_count = 0u32;
     let mut next_delay = COMMAND_HEARTBEAT_INTERVAL;
+    let mut reader = ControlReplyReader::default();
     loop {
         thread::sleep(next_delay);
         let holder = COMMAND_STREAM_HOLDER
@@ -837,7 +818,7 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
             let stream = guard
                 .as_mut()
                 .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
-            send_command_heartbeat(stream, &token)
+            send_command_heartbeat(stream, &token, &mut reader)
         };
         match result {
             Ok(()) => {
@@ -874,31 +855,22 @@ fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
 fn send_command_heartbeat(
     stream: &mut TlsStream<TcpStream>,
     token: &[u8; PROTOCOL_TOKEN_LEN],
+    reader: &mut ControlReplyReader,
 ) -> Result<(), CommandHeartbeatFailure> {
     let message = build_command_message(3, token);
     stream.write_all(&message).map_err(|e| {
         CommandHeartbeatFailure::Retryable(format!("command heartbeat write failed: {e}"))
     })?;
 
-    let mut reply = [0u8; 0x80];
-    let n = read_at_least(
-        stream,
-        &mut reply,
-        COMMAND_REPLY_BODY_EXPECTED_LEN,
-        COMMAND_HEARTBEAT_TIMEOUT,
-    )
-    .map_err(|e| {
-        CommandHeartbeatFailure::Retryable(format!(
-            "command heartbeat read failed: {}",
-            crate::error::concise_error(e)
-        ))
-    })?;
-    if n == 0 {
-        return Err(CommandHeartbeatFailure::Retryable(
-            "command heartbeat reply is empty or timed out".to_string(),
-        ));
-    }
-    classify_command_heartbeat_reply(&reply[..n], &reply[..n]).into_result()
+    let reply = reader
+        .read(stream, COMMAND_HEARTBEAT_TIMEOUT)
+        .map_err(|e| {
+            CommandHeartbeatFailure::Retryable(format!(
+                "command heartbeat read failed: {}",
+                crate::error::concise_error(e)
+            ))
+        })?;
+    classify_command_heartbeat_reply(reply, reply).into_result()
 }
 
 fn classify_command_heartbeat_reply(data: &[u8], raw: &[u8]) -> CommandHeartbeatOutcome {
@@ -942,43 +914,55 @@ impl CommandHeartbeatOutcome {
     }
 }
 
-fn read_at_least<S: Read + Write>(
-    stream: &mut TlsStream<S>,
-    buf: &mut [u8],
-    min_len: usize,
-    timeout: Duration,
-) -> EcResult<usize> {
-    let deadline = Instant::now() + timeout;
-    let mut total = 0usize;
-    while total < min_len && total < buf.len() {
-        if Instant::now() >= deadline {
-            break;
-        }
-        match stream.read(&mut buf[total..]) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) if is_wouldblock_or_timeout(&e) => continue,
-            Err(e) => return Err(EcError::Runtime(format!("stream read failed: {e}"))),
-        }
-    }
-    Ok(total)
+struct ControlReplyReader {
+    bytes: [u8; NATIVE_CONTROL_FRAME_LEN],
+    filled: usize,
 }
 
-fn read_stream_once<S: Read + Write>(
-    stream: &mut TlsStream<S>,
-    buf: &mut [u8],
-    timeout: Duration,
-) -> EcResult<usize> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if Instant::now() >= deadline {
-            return Ok(0);
+impl Default for ControlReplyReader {
+    fn default() -> Self {
+        Self {
+            bytes: [0; NATIVE_CONTROL_FRAME_LEN],
+            filled: 0,
         }
-        match stream.read(buf) {
-            Ok(0) => return Ok(0),
-            Ok(n) => return Ok(n),
-            Err(e) if is_wouldblock_or_timeout(&e) => continue,
-            Err(e) => return Err(EcError::Runtime(format!("stream read failed: {e}"))),
+    }
+}
+
+impl ControlReplyReader {
+    fn read(&mut self, stream: &mut impl Read, timeout: Duration) -> std::io::Result<&[u8]> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Read only this frame, even when TLS supplies several at once.
+            let end = if self.filled < NATIVE_CONTROL_MAGIC.len() {
+                NATIVE_CONTROL_MAGIC.len()
+            } else if self.bytes.starts_with(NATIVE_CONTROL_MAGIC) {
+                NATIVE_CONTROL_FRAME_LEN
+            } else {
+                COMMAND_REPLY_BODY_EXPECTED_LEN
+            };
+            if self.filled == end && end > NATIVE_CONTROL_MAGIC.len() {
+                self.filled = 0;
+                return Ok(&self.bytes[..end]);
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "control reply timed out",
+                ));
+            }
+            match stream.read(&mut self.bytes[self.filled..end]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "incomplete control reply",
+                    ));
+                }
+                Ok(n) => self.filled += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted || is_wouldblock_or_timeout(&e) => {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 }
@@ -1020,6 +1004,148 @@ mod tests {
         TunnelRuntimeParams, classify_command_heartbeat_reply, should_forward_rx_payload,
         validate_stream_ack,
     };
+    use std::io::{self, Cursor, Read};
+    use std::time::Duration;
+
+    struct SplitReply {
+        input: Cursor<Vec<u8>>,
+        split: usize,
+        timeout_at_split: bool,
+    }
+
+    impl Read for SplitReply {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let position = self.input.position() as usize;
+            if position == self.split && self.timeout_at_split {
+                self.timeout_at_split = false;
+                std::thread::sleep(Duration::from_millis(2));
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let count = if position < self.split {
+                out.len().min(self.split - position)
+            } else {
+                out.len()
+            };
+            self.input.read(&mut out[..count])
+        }
+    }
+
+    fn control_reply(native: bool, code: u32) -> Vec<u8> {
+        let mut reply = vec![0; if native { 40 } else { 36 }];
+        let offset = if native {
+            reply[..4].copy_from_slice(b"AABB");
+            4
+        } else {
+            0
+        };
+        reply[offset..offset + 4].copy_from_slice(&code.to_le_bytes());
+        reply
+    }
+
+    #[test]
+    fn control_replies_reassemble_at_every_boundary_without_consuming_next_frame() {
+        for native in [false, true] {
+            for code in [1, 2, 8, 15] {
+                let frame = control_reply(native, code);
+                for split in 1..=frame.len() {
+                    let following = control_reply(!native, 8);
+                    let mut stream = SplitReply {
+                        input: Cursor::new([frame.clone(), following.clone()].concat()),
+                        split,
+                        timeout_at_split: false,
+                    };
+                    let mut reader = super::ControlReplyReader::default();
+                    let reply = reader.read(&mut stream, Duration::from_secs(1)).unwrap();
+                    assert_eq!(reply, frame);
+                    assert_eq!(
+                        super::parse_command_control_reply(reply).unwrap().code(),
+                        code
+                    );
+                    if code == 1 || code == 2 {
+                        let profile = if code == 1 {
+                            StreamProfile::Rx
+                        } else {
+                            StreamProfile::Tx
+                        };
+                        assert!(
+                            validate_stream_ack(
+                                profile,
+                                StreamOpenKind::First,
+                                profile.first_op_code(),
+                                profile.expected_ack(),
+                                reply
+                            )
+                            .is_ok()
+                        );
+                    } else if code == 15 {
+                        assert!(matches!(
+                            classify_command_heartbeat_reply(reply, reply),
+                            CommandHeartbeatOutcome::Ack
+                        ));
+                    }
+                    assert_eq!(
+                        reader.read(&mut stream, Duration::from_secs(1)).unwrap(),
+                        following
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_reply_timeouts_preserve_partial_header_and_body() {
+        for native in [false, true] {
+            let frame = control_reply(native, 15);
+            for split in [1, 3, 4, 16, frame.len() - 1] {
+                let mut stream = SplitReply {
+                    input: Cursor::new(frame.clone()),
+                    split,
+                    timeout_at_split: true,
+                };
+                let mut reader = super::ControlReplyReader::default();
+                assert_eq!(
+                    reader
+                        .read(&mut stream, Duration::from_millis(1))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+                assert_eq!(
+                    reader.read(&mut stream, Duration::from_secs(1)).unwrap(),
+                    frame
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_control_replies_are_never_accepted() {
+        for native in [false, true] {
+            let frame = control_reply(native, 15);
+            for end in 0..frame.len() {
+                let mut reader = super::ControlReplyReader::default();
+                let error = reader
+                    .read(&mut &frame[..end], Duration::from_secs(1))
+                    .unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "end={end}");
+            }
+        }
+    }
+
+    #[test]
+    fn code_style_ack_checks_the_whole_code() {
+        let reply = control_reply(false, 0x101);
+        assert!(
+            validate_stream_ack(
+                StreamProfile::Rx,
+                StreamOpenKind::First,
+                6,
+                NativeControlType::RxAck,
+                &reply
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn stream_profiles_use_official_first_and_resume_ops() {
@@ -1059,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_ack_rejects_wrong_type_and_accepts_legacy_marker() {
+    fn stream_ack_rejects_wrong_type_and_accepts_code_style_reply() {
         let mut frame = [0u8; 0x28];
         frame[0..4].copy_from_slice(b"AABB");
         frame[4..8].copy_from_slice(&2u32.to_le_bytes());
@@ -1074,7 +1200,8 @@ mod tests {
             .is_err()
         );
 
-        let legacy_marker_reply = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut legacy_marker_reply = [0u8; 36];
+        legacy_marker_reply[0] = 1;
         assert!(
             validate_stream_ack(
                 StreamProfile::Rx,
