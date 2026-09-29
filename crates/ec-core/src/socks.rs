@@ -435,7 +435,7 @@ fn relay_client_to_tunnel(
 ) -> EcResult<()> {
     let mut buf = [0u8; TUNNEL_UPLOAD_BUFFER_SIZE];
     loop {
-        match client.read(&mut buf) {
+        match read_relay(&mut client, &mut buf) {
             Ok(0) => return sender.close(),
             Ok(n) => {
                 if let Err(err) = sender.send(buf[..n].to_vec()) {
@@ -478,7 +478,7 @@ fn relay_tunnel_to_client(
 fn pump_stream(mut src: &TcpStream, mut dst: &TcpStream, direction: &'static str) -> EcResult<()> {
     let mut buf = [0u8; RELAY_BUFFER_SIZE];
     let result = loop {
-        match src.read(&mut buf) {
+        match read_relay(&mut src, &mut buf) {
             Ok(0) => break Ok(()),
             Ok(n) => {
                 if let Err(err) = dst.write_all(&buf[..n]) {
@@ -503,6 +503,21 @@ fn relay_io_result(err: std::io::Error, context: &str) -> EcResult<()> {
         Ok(())
     } else {
         Err(EcError::Runtime(format!("{context} failed: {err}")))
+    }
+}
+
+fn read_relay(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            // Winsock cancellation must still terminate the relay, even if a
+            // future std version maps WSAEINTR to Interrupted.
+            Err(err)
+                if err.kind() == ErrorKind::Interrupted && !is_expected_relay_io_error(&err) =>
+            {
+                continue;
+            }
+            result => return result,
+        }
     }
 }
 
@@ -1131,6 +1146,7 @@ mod tests {
         for code in [WSAEINTR, WSA_OPERATION_ABORTED] {
             let err = std::io::Error::from_raw_os_error(code);
             assert!(super::relay_io_result(err, "relay read").is_ok(), "{code}");
+            assert_read_error_is_not_retried(std::io::Error::from_raw_os_error(code));
         }
         for code in [WSAETIMEDOUT, WSAEACCES] {
             let err = std::io::Error::from_raw_os_error(code);
@@ -1139,6 +1155,58 @@ mod tests {
         assert!(!is_expected_relay_io_error(&std::io::Error::from(
             std::io::ErrorKind::TimedOut
         )));
+    }
+
+    struct InterruptedReader {
+        input: std::io::Cursor<Vec<u8>>,
+        error: Option<std::io::Error>,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(error) = self.error.take() {
+                return Err(error);
+            }
+            self.input.read(out)
+        }
+    }
+
+    #[test]
+    fn interrupted_relay_read_retries_without_losing_data_or_eof() {
+        let mut reader = InterruptedReader {
+            input: std::io::Cursor::new(b"payload".to_vec()),
+            error: Some(std::io::ErrorKind::Interrupted.into()),
+        };
+        let mut out = [0; 7];
+        assert_eq!(super::read_relay(&mut reader, &mut out).unwrap(), 7);
+        assert_eq!(&out, b"payload");
+        reader.error = Some(std::io::ErrorKind::Interrupted.into());
+        assert_eq!(super::read_relay(&mut reader, &mut out).unwrap(), 0);
+    }
+
+    fn assert_read_error_is_not_retried(error: std::io::Error) {
+        let kind = error.kind();
+        let code = error.raw_os_error();
+        let mut reader = InterruptedReader {
+            input: std::io::Cursor::new(b"unread".to_vec()),
+            error: Some(error),
+        };
+        let error = super::read_relay(&mut reader, &mut [0; 6]).unwrap_err();
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.raw_os_error(), code);
+        assert_eq!(reader.input.position(), 0);
+    }
+
+    #[test]
+    fn relay_read_preserves_failures_and_timeouts() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert_read_error_is_not_retried(kind.into());
+        }
     }
 
     #[test]
