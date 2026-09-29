@@ -824,13 +824,11 @@ mod tests {
     }
 
     #[test]
-    fn refused_direct_connection_sends_failure_reply_before_closing() {
+    fn failed_direct_connection_sends_failure_reply_before_closing() {
         install_empty_test_router();
-        let refused =
-            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        refused.bind(&addr.into()).unwrap();
-        let target = refused.local_addr().unwrap().as_socket().unwrap();
+        // No listener can own port zero. A bound, non-listening socket instead
+        // drops SYNs on macOS, so it cannot reliably produce a connect failure.
+        let target: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
