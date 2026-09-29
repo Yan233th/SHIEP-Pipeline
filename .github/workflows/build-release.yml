@@ -13,9 +13,9 @@ jobs:
     name: Build and Upload (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_TERM_COLOR: always
       BIN_NAME: SHIEP-Pipeline
-      VERSION: ${{ github.ref_name }}
       SHIEP_PIPELINE_VERSION: ${{ github.ref_name }}
     strategy:
       fail-fast: false
@@ -45,8 +45,8 @@ jobs:
           rustc +stable -V
           cargo +stable -V
 
-      - name: Build binary
-        run: cargo +stable build --locked --release -p ec-cli --target ${{ matrix.target }}
+      - name: Build and check binary
+        run: cargo +stable run --locked --release -p ec-cli -- --version
 
       - name: Upload release binary (Unix)
         if: runner.os != 'Windows'
@@ -55,10 +55,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p dist
-          OUT="dist/${BIN_NAME}-${VERSION}-${{ matrix.target_label }}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$OUT"
-          gh release upload "$VERSION" "$OUT" --clobber
+          OUT="${BIN_NAME}-${SHIEP_PIPELINE_VERSION}-${{ matrix.target_label }}"
+          cp "target/${CARGO_BUILD_TARGET}/release/${BIN_NAME}" "$OUT"
+          gh release upload "$SHIEP_PIPELINE_VERSION" "$OUT" --clobber
 
       - name: Upload release binary (Windows)
         if: runner.os == 'Windows'
@@ -66,7 +65,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $Out = "dist/$env:BIN_NAME-$env:VERSION-${{ matrix.target_label }}.exe"
-          Copy-Item "target/${{ matrix.target }}/release/$env:BIN_NAME.exe" $Out
-          gh release upload "$env:VERSION" $Out --clobber
+          $Out = "$env:BIN_NAME-$env:SHIEP_PIPELINE_VERSION-${{ matrix.target_label }}.exe"
+          Copy-Item "target/$env:CARGO_BUILD_TARGET/release/$env:BIN_NAME.exe" $Out
+          gh release upload "$env:SHIEP_PIPELINE_VERSION" $Out --clobber

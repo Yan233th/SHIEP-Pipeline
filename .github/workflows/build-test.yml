@@ -12,7 +12,9 @@ jobs:
     name: Build (${{ matrix.target_label }})
     runs-on: ${{ matrix.os }}
     env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
       CARGO_TERM_COLOR: always
+      SHIEP_PIPELINE_VERSION: test-${{ github.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -29,7 +31,6 @@ jobs:
 
     steps:
       - name: Checkout
-        id: checkout
         uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -43,17 +44,13 @@ jobs:
           cargo +stable -V
 
       - name: Test workspace
-        run: cargo +stable test --locked --workspace --target ${{ matrix.target }}
+        run: cargo +stable test --locked --workspace
 
       - name: Build and check debug binary
-        env:
-          SHIEP_PIPELINE_VERSION: test-${{ steps.checkout.outputs.commit }}
-        run: cargo +stable run --locked -p ec-cli --target ${{ matrix.target }} -- --version
+        run: cargo +stable run --locked -p ec-cli -- --version
 
       - name: Build and check release binary
-        env:
-          SHIEP_PIPELINE_VERSION: test-${{ steps.checkout.outputs.commit }}
-        run: cargo +stable run --locked --release -p ec-cli --target ${{ matrix.target }} -- --version
+        run: cargo +stable run --locked --release -p ec-cli -- --version
 
       - name: Package test binaries (Unix)
         if: runner.os != 'Windows'
