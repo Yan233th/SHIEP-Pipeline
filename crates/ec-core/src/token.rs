@@ -1,6 +1,6 @@
 use crate::endpoint::parse_server;
 use crate::error::{EcError, EcResult};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
 const TOKEN_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -18,24 +18,7 @@ pub fn fetch_agent_token(server: &str, twf_id: &str) -> EcResult<String> {
         .write_all(request.as_bytes())
         .map_err(|e| EcError::Runtime(format!("token request write failed: {e}")))?;
 
-    let mut received_response = false;
-    let mut buf = [0u8; 4096];
-    let deadline = Instant::now() + TOKEN_READ_DEADLINE;
-    while Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(_) => received_response = true,
-            Err(e) if e.kind() == ErrorKind::TimedOut || e.kind() == ErrorKind::WouldBlock => {
-                break;
-            }
-            Err(e) => return Err(EcError::Runtime(format!("token response read failed: {e}"))),
-        }
-    }
-    if !received_response {
-        return Err(EcError::Runtime(
-            "token response is empty or timed out".to_string(),
-        ));
-    }
+    read_token_responses(&mut BufReader::new(&mut stream))?;
 
     let session_id = stream.session_id();
     if session_id.is_empty() {
@@ -63,9 +46,32 @@ fn build_token_request(authority: &str, twf_id: &str) -> String {
     )
 }
 
+fn read_token_responses(reader: &mut impl BufRead) -> EcResult<()> {
+    let deadline = Instant::now() + TOKEN_READ_DEADLINE;
+    for _ in 0..2 {
+        crate::http_response::read_response(reader, deadline)
+            .map_err(|e| EcError::Runtime(format!("token response read failed: {e}")))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::build_token_request;
+    use super::{build_token_request, read_token_responses};
+
+    #[test]
+    fn token_requires_both_complete_responses() {
+        let first = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nconf";
+        let second = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n<Resource/>";
+        let pair = format!("{first}{second}");
+        assert!(read_token_responses(&mut pair.as_bytes()).is_ok());
+        for end in 0..pair.len() {
+            assert!(
+                read_token_responses(&mut &pair.as_bytes()[..end]).is_err(),
+                "end={end}"
+            );
+        }
+    }
 
     #[test]
     fn build_token_request_contains_expected_paths_and_cookie() {

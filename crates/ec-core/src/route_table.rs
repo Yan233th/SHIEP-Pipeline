@@ -4,7 +4,7 @@ use quick_xml::Reader;
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -50,28 +50,17 @@ pub fn fetch_route_table(server: &str, twf_id: &str) -> EcResult<RouteTable> {
         .write_all(request.as_bytes())
         .map_err(|e| EcError::Runtime(format!("rclist request write failed: {e}")))?;
 
-    let mut buf = [0u8; 4096];
-    let mut raw = Vec::new();
     let deadline = Instant::now() + ROUTE_TABLE_RESPONSE_TIMEOUT;
-    while Instant::now() < deadline {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(e) if is_timeout_or_wouldblock(&e) => break,
-            Err(e) => {
-                return Err(EcError::Runtime(format!(
-                    "rclist response read failed: {e}"
-                )));
-            }
-        }
-    }
-    if raw.is_empty() {
-        return Err(EcError::Runtime(
-            "rclist response is empty or timed out".to_string(),
-        ));
+    let response = crate::http_response::read_response(&mut BufReader::new(stream), deadline)
+        .map_err(|e| EcError::Runtime(format!("rclist response read failed: {e}")))?;
+    if response.status != 200 {
+        return Err(EcError::Runtime(format!(
+            "rclist request failed: HTTP {}",
+            response.status
+        )));
     }
 
-    let text = std::str::from_utf8(&raw)
+    let text = std::str::from_utf8(&response.body)
         .map_err(|e| EcError::Runtime(format!("rclist response is not valid UTF-8: {e}")))?;
     let xml_payload = extract_xml_payload(text)?;
     parse_route_table_xml(xml_payload)
@@ -246,34 +235,7 @@ fn parse_dns(
     Ok(())
 }
 
-fn is_timeout_or_wouldblock(err: &std::io::Error) -> bool {
-    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-}
-
-fn extract_xml_payload(response_text: &str) -> EcResult<&str> {
-    let (headers, body) = response_text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| EcError::Runtime("rclist response headers are incomplete".to_string()))?;
-    let mut lines = headers.lines();
-    let status = lines.next().unwrap_or_default();
-    if status.split_whitespace().nth(1) != Some("200") {
-        return Err(EcError::Runtime(format!("rclist request failed: {status}")));
-    }
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            let expected = value.trim().parse::<usize>().map_err(|_| {
-                EcError::Runtime("rclist response has invalid Content-Length".to_string())
-            })?;
-            if body.len() != expected {
-                return Err(EcError::Runtime(format!(
-                    "rclist response length mismatch: expected {expected} bytes, got {}",
-                    body.len()
-                )));
-            }
-        }
-    }
+fn extract_xml_payload(body: &str) -> EcResult<&str> {
     let xml_start = body
         .find("<?xml")
         .or_else(|| body.find("<Resource"))
@@ -477,14 +439,14 @@ mod tests {
 
     #[test]
     fn extract_xml_payload_finds_resource_start() {
-        let raw = "HTTP/1.1 200 OK\r\n\r\n<Resource><Rcs/></Resource>";
+        let raw = "<Resource><Rcs/></Resource>";
         let xml = extract_xml_payload(raw).unwrap();
         assert!(xml.starts_with("<Resource>"));
     }
 
     #[test]
     fn extract_xml_payload_rejects_non_xml_text() {
-        let err = extract_xml_payload("HTTP/1.1 200 OK\r\n\r\nhello").unwrap_err();
+        let err = extract_xml_payload("hello").unwrap_err();
         assert!(err.to_string().contains("does not contain XML payload"));
     }
 
@@ -519,23 +481,5 @@ mod tests {
         }
         assert!(parse_route_table_xml(" \n<Resource/>\n ").is_ok());
         assert!(parse_route_table_xml("<!-- routes --><Resource></Resource><!-- end -->").is_ok());
-    }
-
-    #[test]
-    fn response_checks_http_status_and_declared_body_length() {
-        let xml = "<Resource/>";
-        let complete = format!(
-            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{xml}",
-            xml.len()
-        );
-        assert_eq!(extract_xml_payload(&complete).unwrap(), xml);
-        for invalid in [
-            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n<Resource/>",
-            "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n<Resource/>",
-            "HTTP/1.1 403 Forbidden\r\n\r\n<Resource/>",
-            "HTTP/1.1 200 OK\r\n",
-        ] {
-            assert!(extract_xml_payload(invalid).is_err());
-        }
     }
 }

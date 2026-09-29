@@ -6,6 +6,7 @@ pub mod output;
 mod auth;
 mod dns_resolver;
 mod endpoint;
+mod http_response;
 mod netstack;
 mod netstack_device;
 mod protocol;
