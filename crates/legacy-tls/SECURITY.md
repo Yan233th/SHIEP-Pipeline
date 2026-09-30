@@ -51,11 +51,13 @@ the native keys, and checks that the wrong transcript is still rejected.
 An opt-in release test checks 8 MiB in each direction over TLS 1.1/CBC.
 See that package's README for commands.
 
-Windows MSVC and Apple Silicon workspace checks and actual release-library
-builds complement Linux tests. These cross builds do not establish application
-linking or runtime behavior on Windows/macOS. The timing diagnostic reports
-samples and Welch's t statistic. Host noise and the instrumented test build
-prevent treating it as certification.
+The [native Actions run](https://github.com/Yan233th/SHIEP-Pipeline/actions/runs/36621555961)
+at `bd233f6` passed workspace tests, debug/release application builds and
+`--version` execution on Linux x64, Windows MSVC x64 and macOS ARM64. Live VPN
+use has also been tested on Linux and reported working on Windows; macOS has
+not yet had a live gateway test. These are functional checks, not an independent
+security audit. The timing diagnostic reports samples and Welch's t statistic.
+Host noise and the instrumented test build prevent treating it as certification.
 
 ## Dependency review
 
