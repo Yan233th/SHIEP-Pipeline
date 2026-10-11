@@ -115,7 +115,7 @@ enum RouteMode {
 struct RouteMatcher {
     rules: Vec<CompiledRule>,
     rule_index: RuleIndex,
-    dns_map: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
+    dns_map: HashMap<i32, HashMap<String, Ipv4Addr>>,
     dns_exact: HashMap<String, Vec<Ipv4Addr>>,
     dns_servers: Vec<SocketAddr>,
     dns_records: usize,
@@ -234,11 +234,10 @@ impl RouteMatcher {
             },
             TargetKind::Ipv6(ip) => plan_ipv6_fallback(*ip, port),
             TargetKind::Domain(domain) => {
-                if let Some(ipv4s) = self
+                if let Some(ip) = self
                     .dns_map
                     .get(&rule.rc_id)
                     .and_then(|domains| domains.get(domain))
-                    && let Some(ip) = ipv4s.first()
                 {
                     return RoutePlan::Remote {
                         dial: format!("{ip}:{port}"),
@@ -607,13 +606,13 @@ fn compile_rules(raw_rules: Vec<RouteRule>) -> Vec<CompiledRule> {
 
 #[derive(Debug, Clone)]
 struct DnsIndexes {
-    scoped: HashMap<i32, HashMap<String, Vec<Ipv4Addr>>>,
+    scoped: HashMap<i32, HashMap<String, Ipv4Addr>>,
     exact: HashMap<String, Vec<Ipv4Addr>>,
     record_count: usize,
 }
 
 fn build_dns_indexes(raw_dns_records: Vec<crate::route_table::DnsRecord>) -> DnsIndexes {
-    let mut scoped = HashMap::<i32, HashMap<String, Vec<Ipv4Addr>>>::new();
+    let mut scoped = HashMap::<i32, HashMap<String, Ipv4Addr>>::new();
     let mut exact = HashMap::<String, Vec<Ipv4Addr>>::new();
     let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
     let mut seen_exact = HashSet::<(String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
@@ -632,8 +631,7 @@ fn build_dns_indexes(raw_dns_records: Vec<crate::route_table::DnsRecord>) -> Dns
             .entry(rec.rc_id)
             .or_default()
             .entry(host.clone())
-            .or_default()
-            .push(ip);
+            .or_insert(ip);
         if seen_exact.insert((host.clone(), ip)) {
             exact.entry(host).or_default().push(ip);
         }
@@ -1419,14 +1417,16 @@ mod tests {
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
         assert_eq!(matcher.dns_records, 3);
-        let ips = matcher
+        let first_ip = matcher
             .dns_map
             .get(&205)
             .and_then(|domains| domains.get("ids.shiep.edu.cn"))
             .unwrap();
-        assert_eq!(ips.len(), 2);
-        assert_eq!(ips[0].to_string(), "10.166.35.11");
-        assert_eq!(ips[1].to_string(), "10.166.35.12");
+        assert_eq!(first_ip.to_string(), "10.166.35.11");
+        let RoutePlan::Remote { dial, .. } = matcher.plan("ids.shiep.edu.cn", 443) else {
+            panic!("expected the first scoped address to remain the remote target");
+        };
+        assert_eq!(dial, "10.166.35.11:443");
         let exact_ips = matcher.dns_exact.get("ids.shiep.edu.cn").unwrap();
         assert_eq!(exact_ips.len(), 2);
         assert_eq!(exact_ips[0].to_string(), "10.166.35.11");
