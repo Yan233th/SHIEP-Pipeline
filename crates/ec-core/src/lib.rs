@@ -23,4 +23,3 @@ mod token;
 pub use app::EasyConnectApp;
 pub use config::AppConfig;
 pub use error::{EcError, EcResult};
-pub use protocol::{send_tunnel_packet, take_tunnel_packet_receiver};

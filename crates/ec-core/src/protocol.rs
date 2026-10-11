@@ -11,7 +11,7 @@ use crate::protocol_wire::{
 use legacy_tls::TlsStream;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +24,6 @@ const COMMAND_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const COMMAND_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_HEARTBEAT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COMMAND_HEARTBEAT_FAILURE_LIMIT: u32 = 3;
-const RUNTIME_ALREADY_STARTED: &str = "tunnel runtime already started in this process";
 
 #[derive(Clone, Copy)]
 enum StreamProfile {
@@ -252,8 +251,6 @@ impl From<SendIpReply> for TunnelIps {
     }
 }
 
-static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
-static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamInit> {
     let (authority, _) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
@@ -274,8 +271,7 @@ pub fn start_tunnel_runtime(server: &str, token: &str, command: CommandStreamIni
     output::success(Scope::Protocol, "TX handshake successful");
 
     let (tx_sender, tx_receiver) = mpsc::channel::<Vec<u8>>();
-    let (rx_sender, rx_receiver) = mpsc::channel::<Vec<u8>>();
-    install_runtime_channels(tx_sender, rx_receiver)?;
+    let rx_sender = crate::netstack::start_runtime(runtime.assigned_ip, tx_sender)?;
 
     let rx_runtime = runtime.clone();
     thread::spawn(move || {
@@ -307,49 +303,6 @@ pub fn start_tunnel_runtime(server: &str, token: &str, command: CommandStreamIni
     start_command_heartbeat(command.stream, token_bytes);
 
     Ok(())
-}
-
-fn install_runtime_channels(
-    tx_sender: mpsc::Sender<Vec<u8>>,
-    rx_receiver: mpsc::Receiver<Vec<u8>>,
-) -> EcResult<()> {
-    let rx_holder = RX_PACKET_RECEIVER.get_or_init(|| Mutex::new(None));
-    let mut guard = rx_holder
-        .lock()
-        .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
-    if guard.is_some() || TX_PACKET_SENDER.get().is_some() {
-        return Err(runtime_already_started_err());
-    }
-    TX_PACKET_SENDER
-        .set(tx_sender)
-        .map_err(|_| runtime_already_started_err())?;
-    *guard = Some(rx_receiver);
-    Ok(())
-}
-
-fn runtime_already_started_err() -> EcError {
-    EcError::Runtime(RUNTIME_ALREADY_STARTED.to_string())
-}
-
-pub fn send_tunnel_packet(packet: Vec<u8>) -> EcResult<()> {
-    let sender = TX_PACKET_SENDER
-        .get()
-        .ok_or_else(|| EcError::Runtime("tunnel runtime is not started".to_string()))?;
-    sender
-        .send(packet)
-        .map_err(|e| EcError::Runtime(format!("send tunnel packet failed: {e}")))
-}
-
-pub fn take_tunnel_packet_receiver() -> EcResult<mpsc::Receiver<Vec<u8>>> {
-    let holder = RX_PACKET_RECEIVER
-        .get()
-        .ok_or_else(|| EcError::Runtime("tunnel runtime is not started".to_string()))?;
-    let mut guard = holder
-        .lock()
-        .map_err(|_| EcError::Runtime("rx packet receiver mutex poisoned".to_string()))?;
-    guard.take().ok_or_else(|| {
-        EcError::Runtime("tunnel packet receiver was already taken or not initialized".to_string())
-    })
 }
 
 fn worker_exit_detail(profile: StreamProfile, result: EcResult<()>) -> String {
@@ -405,7 +358,7 @@ fn open_command_stream_once(
 fn rx_worker_loop(
     runtime: TunnelRuntimeParams,
     mut stream: TlsStream<TcpStream>,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<crate::netstack::ControlMessage>,
 ) -> EcResult<()> {
     let mut retries = 0usize;
     let mut buf = [0u8; 4096];
@@ -422,7 +375,12 @@ fn rx_worker_loop(
                 if !should_forward_rx_payload(&buf[..n])? {
                     continue;
                 }
-                if tx.send(buf[..n].to_vec()).is_err() {
+                if tx
+                    .send(crate::netstack::ControlMessage::TunnelPacket {
+                        packet: buf[..n].to_vec(),
+                    })
+                    .is_err()
+                {
                     return Ok(());
                 }
             }

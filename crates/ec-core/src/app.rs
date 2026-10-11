@@ -25,8 +25,7 @@ impl EasyConnectApp {
         let twf_id = self.login()?;
         self.try_install_route_table(&twf_id)?;
         let token = self.acquire_protocol_token(&twf_id)?;
-        let tunnel_ips = self.start_tunnel(&token)?;
-        crate::netstack::start_runtime(tunnel_ips.assigned_ip)?;
+        self.start_tunnel(&token)?;
         Ok((self.config.socks_bind, fallback_proxy))
     }
 
@@ -76,7 +75,7 @@ impl EasyConnectApp {
         Ok(format!("{agent_token}{twf_id}"))
     }
 
-    fn start_tunnel(&self, token: &str) -> EcResult<crate::protocol::TunnelIps> {
+    fn start_tunnel(&self, token: &str) -> EcResult<()> {
         output::info(Scope::Protocol, "opening command stream...");
         let command = crate::protocol::open_command_stream(&self.config.server, token)?;
         let tunnel_ips = command.ips;
@@ -90,7 +89,7 @@ impl EasyConnectApp {
         );
         crate::protocol::start_tunnel_runtime(&self.config.server, token, command)?;
         output::success(Scope::Protocol, "tunnel established");
-        Ok(tunnel_ips)
+        Ok(())
     }
 }
 

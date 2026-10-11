@@ -45,7 +45,7 @@ impl Rig {
                 reply: reply_tx,
             },
             &mut ControlDispatch {
-                device: &mut TunnelDevice::new(),
+                device: &mut TunnelDevice::new(mpsc::channel().0),
                 iface: &mut iface,
                 sockets: &mut sockets,
                 connections: &mut connections,
@@ -117,7 +117,7 @@ impl Rig {
         handle_control_message(
             message,
             &mut ControlDispatch {
-                device: &mut TunnelDevice::new(),
+                device: &mut TunnelDevice::new(mpsc::channel().0),
                 iface: &mut self.iface,
                 sockets: &mut self.sockets,
                 connections: &mut self.connections,

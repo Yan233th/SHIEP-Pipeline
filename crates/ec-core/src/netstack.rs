@@ -22,38 +22,25 @@ const LOCAL_PORT_END: u16 = 60000;
 const LOCAL_PORT_COUNT: usize = (LOCAL_PORT_END - LOCAL_PORT_START) as usize + 1;
 const NETSTACK_CONTROL_DISCONNECTED: &str = "netstack control channel disconnected";
 
-pub fn start_runtime(assigned_ip: [u8; 4]) -> EcResult<()> {
-    if CONTROL_TX.get().is_some() {
-        return Ok(());
-    }
-
-    let tunnel_rx = crate::protocol::take_tunnel_packet_receiver()?;
+pub(crate) fn start_runtime(
+    assigned_ip: [u8; 4],
+    tunnel_tx: mpsc::Sender<Vec<u8>>,
+) -> EcResult<mpsc::Sender<ControlMessage>> {
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
-    let control_tx_for_runtime = control_tx.clone();
+    let ingress = control_tx.clone();
     CONTROL_TX
         .set(control_tx)
         .map_err(|_| EcError::Runtime("netstack runtime already initialized".to_string()))?;
 
     thread::spawn(move || {
-        while let Ok(packet) = tunnel_rx.recv() {
-            if control_tx_for_runtime
-                .send(ControlMessage::TunnelPacket { packet })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-
-    thread::spawn(move || {
-        if let Err(err) = run_netstack_loop(assigned_ip, control_rx) {
+        if let Err(err) = run_netstack_loop(assigned_ip, tunnel_tx, control_rx) {
             let detail = format!("netstack closed: {}", crate::error::concise_error(err));
             output::error(Scope::Netstack, &detail);
             crate::runtime_state::record_fatal(detail);
         }
     });
 
-    Ok(())
+    Ok(ingress)
 }
 
 pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
@@ -184,7 +171,7 @@ impl Drop for TunnelTcpReceiver {
     }
 }
 
-enum ControlMessage {
+pub(crate) enum ControlMessage {
     TunnelPacket {
         packet: Vec<u8>,
     },
@@ -207,7 +194,7 @@ enum ControlMessage {
     },
 }
 
-struct OpenedTcpConnection {
+pub(crate) struct OpenedTcpConnection {
     id: u64,
     uplink_rx: mpsc::Receiver<EcResult<TunnelTcpRead>>,
     send_result_rx: mpsc::Receiver<EcResult<()>>,
@@ -268,9 +255,10 @@ struct ControlDispatch<'a, 'b> {
 
 fn run_netstack_loop(
     assigned_ip: [u8; 4],
+    tunnel_tx: mpsc::Sender<Vec<u8>>,
     control_rx: mpsc::Receiver<ControlMessage>,
 ) -> EcResult<()> {
-    let mut device = TunnelDevice::new();
+    let mut device = TunnelDevice::new(tunnel_tx);
     let mut cfg = Config::new(HardwareAddress::Ip);
     cfg.random_seed = netstack_random_seed();
     let mut iface = Interface::new(cfg, &mut device, smol_now(Instant::now()));
