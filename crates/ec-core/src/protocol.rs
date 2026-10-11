@@ -238,9 +238,9 @@ pub struct TunnelIps {
     pub lan_ip: [u8; 4],
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandStreamInit {
     pub ips: TunnelIps,
+    stream: TlsStream<TcpStream>,
 }
 
 impl From<SendIpReply> for TunnelIps {
@@ -252,16 +252,7 @@ impl From<SendIpReply> for TunnelIps {
     }
 }
 
-impl From<SendIpReply> for CommandStreamInit {
-    fn from(reply: SendIpReply) -> Self {
-        Self { ips: reply.into() }
-    }
-}
-
 static TX_PACKET_SENDER: OnceLock<mpsc::Sender<Vec<u8>>> = OnceLock::new();
-// L3IP op0/SEND_IP leaves a command/control stream open. Official op3
-// heartbeat must stay on that same stream instead of the RX/TX data streams.
-static COMMAND_STREAM_HOLDER: OnceLock<Mutex<Option<TlsStream<TcpStream>>>> = OnceLock::new();
 static RX_PACKET_RECEIVER: OnceLock<Mutex<Option<mpsc::Receiver<Vec<u8>>>>> = OnceLock::new();
 pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamInit> {
     let (authority, _) = parse_server(server)?;
@@ -270,12 +261,12 @@ pub fn open_command_stream(server: &str, token: &str) -> EcResult<CommandStreamI
     open_command_stream_once(&authority, &token_bytes)
 }
 
-pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResult<()> {
+pub fn start_tunnel_runtime(server: &str, token: &str, command: CommandStreamInit) -> EcResult<()> {
     crate::runtime_state::clear_fatal_reason();
 
     let (authority, _) = parse_server(server)?;
     let token_bytes = parse_protocol_token(token)?;
-    let runtime = TunnelRuntimeParams::new(authority, token_bytes, ips);
+    let runtime = TunnelRuntimeParams::new(authority, token_bytes, command.ips);
 
     let rx_stream = runtime.open_stream(StreamProfile::Rx)?;
     output::success(Scope::Protocol, "RX handshake successful");
@@ -313,7 +304,7 @@ pub fn start_tunnel_runtime(server: &str, token: &str, ips: TunnelIps) -> EcResu
             output::value(COMMAND_HEARTBEAT_FAILURE_LIMIT)
         ),
     );
-    start_command_heartbeat(token_bytes);
+    start_command_heartbeat(command.stream, token_bytes);
 
     Ok(())
 }
@@ -405,8 +396,10 @@ fn open_command_stream_once(
     let send_ip = parse_send_ip_reply(reply).inspect_err(|_| {
         debug_protocol_hex("debug: SEND_IP raw reply", reply);
     })?;
-    hold_command_stream(stream)?;
-    Ok(send_ip.into())
+    Ok(CommandStreamInit {
+        ips: send_ip.into(),
+        stream,
+    })
 }
 
 fn rx_worker_loop(
@@ -780,18 +773,9 @@ fn connect_vpn_tls(authority: &str) -> EcResult<TlsStream<TcpStream>> {
     Ok(stream)
 }
 
-fn hold_command_stream(stream: TlsStream<TcpStream>) -> EcResult<()> {
-    let holder = COMMAND_STREAM_HOLDER.get_or_init(|| Mutex::new(None));
-    let mut guard = holder
-        .lock()
-        .map_err(|_| EcError::Runtime("command stream holder mutex poisoned".to_string()))?;
-    *guard = Some(stream);
-    Ok(())
-}
-
-fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
+fn start_command_heartbeat(stream: TlsStream<TcpStream>, token: [u8; PROTOCOL_TOKEN_LEN]) {
     thread::spawn(move || {
-        if let Err(err) = command_heartbeat_loop(token) {
+        if let Err(err) = command_heartbeat_loop(stream, token) {
             let detail = format!(
                 "stream closed: command; reason: {}",
                 crate::error::concise_error(err)
@@ -802,24 +786,17 @@ fn start_command_heartbeat(token: [u8; PROTOCOL_TOKEN_LEN]) {
     });
 }
 
-fn command_heartbeat_loop(token: [u8; PROTOCOL_TOKEN_LEN]) -> EcResult<()> {
+fn command_heartbeat_loop(
+    mut stream: TlsStream<TcpStream>,
+    token: [u8; PROTOCOL_TOKEN_LEN],
+) -> EcResult<()> {
     let mut failure_count = 0u32;
     let mut next_delay = COMMAND_HEARTBEAT_INTERVAL;
     let mut reader = ControlReplyReader::default();
     loop {
         thread::sleep(next_delay);
-        let holder = COMMAND_STREAM_HOLDER
-            .get()
-            .ok_or_else(|| EcError::Runtime("command stream is not initialized".to_string()))?;
-        let result = {
-            let mut guard = holder.lock().map_err(|_| {
-                EcError::Runtime("command stream holder mutex poisoned".to_string())
-            })?;
-            let stream = guard
-                .as_mut()
-                .ok_or_else(|| EcError::Runtime("command stream is not available".to_string()))?;
-            send_command_heartbeat(stream, &token, &mut reader)
-        };
+        // Heartbeats retain the exact command stream opened by SEND_IP.
+        let result = send_command_heartbeat(&mut stream, &token, &mut reader);
         match result {
             Ok(()) => {
                 failure_count = 0;

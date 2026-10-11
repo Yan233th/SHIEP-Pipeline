@@ -88,7 +88,7 @@ impl EasyConnectApp {
                 output::value(Ipv4Addr::from(tunnel_ips.lan_ip))
             ),
         );
-        crate::protocol::start_tunnel_runtime(&self.config.server, token, tunnel_ips)?;
+        crate::protocol::start_tunnel_runtime(&self.config.server, token, command)?;
         output::success(Scope::Protocol, "tunnel established");
         Ok(tunnel_ips)
     }
