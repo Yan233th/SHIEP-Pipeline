@@ -14,7 +14,12 @@ impl EasyConnectApp {
         Self { config }
     }
 
-    pub fn run(&self) -> EcResult<()> {
+    pub fn run(self) -> EcResult<()> {
+        let (bind, fallback_proxy) = self.start()?;
+        crate::socks::serve(&bind, fallback_proxy)
+    }
+
+    fn start(self) -> EcResult<(String, Option<crate::socks_proxy::FallbackProxy>)> {
         let fallback_proxy =
             crate::socks_proxy::parse_fallback_proxy(self.config.fallback_proxy.as_deref())?;
         let twf_id = self.login()?;
@@ -22,7 +27,7 @@ impl EasyConnectApp {
         let token = self.acquire_protocol_token(&twf_id)?;
         let tunnel_ips = self.start_tunnel(&token)?;
         crate::netstack::start_runtime(tunnel_ips.assigned_ip)?;
-        crate::socks::serve(&self.config.socks_bind, fallback_proxy)
+        Ok((self.config.socks_bind, fallback_proxy))
     }
 
     fn login(&self) -> EcResult<String> {
