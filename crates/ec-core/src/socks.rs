@@ -1,12 +1,14 @@
+use crate::endpoint::{ConnectTarget, TargetHost};
 use crate::error::{EcError, EcResult};
 use crate::output::{self, RouteKind, Scope};
-use crate::socks_proxy::{FallbackProxy, connect_via_proxy};
+use crate::socks_proxy::FallbackProxy;
 use crate::socks_wire::{
-    ConnectTarget, SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_GENERAL_FAILURE, SOCKS_REP_SUCCEEDED,
-    SocksCommand, format_socket_target, negotiate_method, read_socks_request, write_reply,
+    SOCKS_REP_CMD_NOT_SUPPORTED, SOCKS_REP_GENERAL_FAILURE, SOCKS_REP_SUCCEEDED, SocksCommand,
+    negotiate_method, read_socks_request, write_reply,
 };
+use std::fmt::Display;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
@@ -107,10 +109,9 @@ fn handle_connect(
     target: ConnectTarget,
     fallback_proxy: Option<&FallbackProxy>,
 ) -> EcResult<()> {
-    let target_display = target.to_string();
     let route = decide_route(&target, fallback_proxy);
-    output::info(Scope::Req, &route.line);
-    execute_route(client, target_display.as_str(), route)
+    output::info(Scope::Req, RouteLine(&target, &route));
+    execute_route(client, &target, route)
 }
 
 fn reject_udp_associate(client: &mut TcpStream) -> EcResult<()> {
@@ -122,51 +123,9 @@ fn reject_udp_associate(client: &mut TcpStream) -> EcResult<()> {
     Ok(())
 }
 
-fn decide_route<'a>(
-    target: &ConnectTarget,
-    fallback_proxy: Option<&'a FallbackProxy>,
-) -> RouteDecision<'a> {
-    let target_display = target.to_string();
-    let target_is_ip = is_ip_host(target.host());
-    match crate::routing::plan_target(target.host(), target.port()) {
-        Ok(crate::routing::RoutePlan::Remote {
-            dial,
-            rc_id: _,
-            rc_name,
-            source,
-            dns_lookup,
-        }) => {
-            let resolved_ip = dial
-                .rsplit_once(':')
-                .map(|(ip, _)| ip)
-                .unwrap_or(dial.as_str());
-            log_resolved_route_source(target.host(), resolved_ip, source, dns_lookup);
-            route_decision_remote(
-                target_display.as_str(),
-                target_is_ip,
-                dial,
-                rc_name,
-                source,
-                dns_lookup,
-            )
-        }
-        Ok(crate::routing::RoutePlan::Fallback {
-            target: planned_target,
-            reason,
-        }) => route_decision_fallback(
-            target.clone(),
-            target_display.as_str(),
-            target_addr(&planned_target),
-            reason,
-            fallback_proxy,
-        ),
-        Err(err) => route_decision_planner_error(target_display.as_str(), err),
-    }
-}
-
 fn log_resolved_route_source(
-    host: &str,
-    resolved_ip: &str,
+    host: &TargetHost,
+    resolved_ip: &TargetHost,
     source: crate::routing::RouteSource,
     dns_lookup: Option<crate::dns_resolver::ResolveSource>,
 ) {
@@ -209,171 +168,191 @@ fn log_resolved_route_source(
     }
 }
 
-fn route_decision_remote(
-    target_display: &str,
-    target_is_ip: bool,
-    dial: String,
-    rc_name: String,
+fn decide_route<'a>(
+    target: &ConnectTarget,
+    fallback_proxy: Option<&'a FallbackProxy>,
+) -> RouteDecision<'a> {
+    match crate::routing::plan_target(target) {
+        Ok(crate::routing::RoutePlan::Remote {
+            dial,
+            rc_id: _,
+            rc_name,
+            source,
+            dns_lookup,
+        }) => {
+            log_resolved_route_source(target.host(), dial.host(), source, dns_lookup);
+            RouteDecision::Remote {
+                dial,
+                rc_name: if rc_name.trim().is_empty() {
+                    "unknown"
+                } else {
+                    rc_name
+                },
+                source,
+                dns_lookup,
+            }
+        }
+        Ok(crate::routing::RoutePlan::Fallback { reason }) => RouteDecision::Fallback {
+            proxy: fallback_proxy,
+            reason,
+        },
+        Err(err) => RouteDecision::Unavailable(crate::error::concise_error(err)),
+    }
+}
+
+enum RouteDecision<'a> {
+    Remote {
+        dial: ConnectTarget,
+        rc_name: &'a str,
+        source: crate::routing::RouteSource,
+        dns_lookup: Option<crate::dns_resolver::ResolveSource>,
+    },
+    Fallback {
+        proxy: Option<&'a FallbackProxy>,
+        reason: std::borrow::Cow<'static, str>,
+    },
+    Unavailable(String),
+}
+
+struct RouteLine<'a>(&'a ConnectTarget, &'a RouteDecision<'a>);
+
+impl Display for RouteLine<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let target = self.0;
+        let arrow = output::weak(" -> ");
+        write!(f, "{target}{arrow}")?;
+        match self.1 {
+            RouteDecision::Remote { dial, rc_name, .. } => {
+                write!(
+                    f,
+                    "{}{arrow}{rc_name}",
+                    output::route_label(RouteKind::Remote)
+                )?;
+                if matches!(target.host(), TargetHost::Domain(_)) {
+                    write!(f, "{}{dial}{}", output::weak("("), output::weak(")"))?;
+                }
+                Ok(())
+            }
+            RouteDecision::Fallback { proxy, .. } => {
+                write!(f, "{}{arrow}", output::route_label(RouteKind::Fallback))?;
+                match proxy {
+                    Some(proxy) => write!(f, "{}", output::value(&proxy.url)),
+                    None => write!(f, "{}", output::route_label(RouteKind::Direct)),
+                }
+            }
+            RouteDecision::Unavailable(_) => write!(
+                f,
+                "{}{arrow}route planner unavailable",
+                output::route_label(RouteKind::Fallback)
+            ),
+        }
+    }
+}
+
+struct RoutePath<'a>(&'a ConnectTarget, &'a RouteDecision<'a>);
+
+impl Display for RoutePath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.1 {
+            RouteDecision::Remote {
+                dial,
+                rc_name,
+                source,
+                dns_lookup,
+            } => write!(
+                f,
+                "remote -> {rc_name}({dial}); source: {}",
+                describe_route_source(*source, *dns_lookup)
+            ),
+            RouteDecision::Fallback {
+                proxy: Some(proxy),
+                reason,
+            } => write!(f, "fallback -> {}; reason: {reason}", proxy.url),
+            RouteDecision::Fallback {
+                proxy: None,
+                reason,
+            } => write!(f, "fallback -> direct; dial: {}; reason: {reason}", self.0),
+            RouteDecision::Unavailable(reason) => {
+                write!(f, "fallback -> unavailable; reason: {reason}")
+            }
+        }
+    }
+}
+
+struct RouteSourceDisplay {
     source: crate::routing::RouteSource,
     dns_lookup: Option<crate::dns_resolver::ResolveSource>,
-) -> RouteDecision<'static> {
-    let arrow = output::weak(" -> ");
-    let lparen = output::weak("(");
-    let rparen = output::weak(")");
-    let name = if rc_name.trim().is_empty() {
-        "unknown".to_string()
-    } else {
-        rc_name
-    };
-    let line = if target_is_ip {
-        format!(
-            "{target_display}{arrow}{}{arrow}{name}",
-            output::route_label(RouteKind::Remote),
-        )
-    } else {
-        format!(
-            "{target_display}{arrow}{}{arrow}{name}{lparen}{dial}{rparen}",
-            output::route_label(RouteKind::Remote),
-        )
-    };
-    RouteDecision {
-        line,
-        path: format!(
-            "remote -> {name}({dial}); source: {}",
-            describe_route_source(source, dns_lookup)
-        ),
-        transport: RouteTransport::Tunnel(dial),
-    }
 }
 
 fn describe_route_source(
     source: crate::routing::RouteSource,
     dns_lookup: Option<crate::dns_resolver::ResolveSource>,
-) -> String {
-    match (source, dns_lookup) {
-        (
-            crate::routing::RouteSource::DnsServer,
-            Some(crate::dns_resolver::ResolveSource::Cache),
-        ) => "dns-cache".to_string(),
-        (
-            crate::routing::RouteSource::CnameDnsServer,
-            Some(crate::dns_resolver::ResolveSource::Cache),
-        ) => "cname-dns-cache".to_string(),
-        (
-            crate::routing::RouteSource::DnsServerIpRule,
-            Some(crate::dns_resolver::ResolveSource::Cache),
-        ) => "dns-server-ip-rule-cache".to_string(),
-        (
-            crate::routing::RouteSource::DnsServer,
-            Some(crate::dns_resolver::ResolveSource::Server(server)),
-        ) => {
-            format!("dns-server({server})")
-        }
-        (
-            crate::routing::RouteSource::CnameDnsServer,
-            Some(crate::dns_resolver::ResolveSource::Server(server)),
-        ) => format!("cname-dns-server({server})"),
-        (
-            crate::routing::RouteSource::DnsServerIpRule,
-            Some(crate::dns_resolver::ResolveSource::Server(server)),
-        ) => format!("dns-server-ip-rule({server})"),
-        (source, Some(crate::dns_resolver::ResolveSource::Cache)) => {
-            format!("{} via dns-cache", source.label())
-        }
-        (source, Some(crate::dns_resolver::ResolveSource::Server(server))) => {
-            format!("{} via dns-server({server})", source.label())
-        }
-        (source, None) => source.label().to_string(),
-    }
+) -> RouteSourceDisplay {
+    RouteSourceDisplay { source, dns_lookup }
 }
 
-fn route_decision_fallback<'a>(
-    target: ConnectTarget,
-    target_display: &str,
-    dial: String,
-    reason: String,
-    fallback_proxy: Option<&'a FallbackProxy>,
-) -> RouteDecision<'a> {
-    let arrow = output::weak(" -> ");
-    if let Some(proxy) = fallback_proxy {
-        return RouteDecision {
-            line: format!(
-                "{target_display}{arrow}{}{arrow}{}",
-                output::route_label(RouteKind::Fallback),
-                output::value(proxy.url.as_str()),
-            ),
-            path: format!("fallback -> {}; reason: {reason}", proxy.url),
-            transport: RouteTransport::Proxy(proxy, target),
-        };
-    }
-
-    RouteDecision {
-        line: format!(
-            "{target_display}{arrow}{}{arrow}{}",
-            output::route_label(RouteKind::Fallback),
-            output::route_label(RouteKind::Direct),
-        ),
-        path: format!("fallback -> direct; dial: {dial}; reason: {reason}"),
-        transport: RouteTransport::Direct(dial),
-    }
-}
-
-fn route_decision_planner_error(target_display: &str, err: EcError) -> RouteDecision<'static> {
-    let arrow = output::weak(" -> ");
-    let reason = crate::error::concise_error(err);
-    RouteDecision {
-        line: format!(
-            "{target_display}{arrow}{}{arrow}route planner unavailable",
-            output::route_label(RouteKind::Fallback),
-        ),
-        path: format!("fallback -> unavailable; reason: {reason}"),
-        transport: RouteTransport::Unsupported("no route transport available".to_string()),
+impl Display for RouteSourceDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::dns_resolver::ResolveSource;
+        use crate::routing::RouteSource;
+        match (self.source, self.dns_lookup) {
+            (RouteSource::DnsServer, Some(ResolveSource::Cache)) => f.write_str("dns-cache"),
+            (RouteSource::CnameDnsServer, Some(ResolveSource::Cache)) => {
+                f.write_str("cname-dns-cache")
+            }
+            (RouteSource::DnsServerIpRule, Some(ResolveSource::Cache)) => {
+                f.write_str("dns-server-ip-rule-cache")
+            }
+            (
+                RouteSource::DnsServer | RouteSource::CnameDnsServer | RouteSource::DnsServerIpRule,
+                Some(ResolveSource::Server(server)),
+            ) => write!(f, "{}({server})", self.source.label()),
+            (source, Some(ResolveSource::Cache)) => write!(f, "{} via dns-cache", source.label()),
+            (source, Some(ResolveSource::Server(server))) => {
+                write!(f, "{} via dns-server({server})", source.label())
+            }
+            (source, None) => f.write_str(source.label()),
+        }
     }
 }
 
 fn execute_route(
     mut client: TcpStream,
-    target_display: &str,
+    target: &ConnectTarget,
     route: RouteDecision<'_>,
 ) -> EcResult<()> {
-    let RouteDecision {
-        line: _,
-        path,
-        transport,
-    } = route;
-    let route_path = path.as_str();
-
-    match transport {
-        RouteTransport::Tunnel(dial_target) => {
-            let conn = crate::netstack::open_tcp_connection(&dial_target)
-                .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
-            write_connect_ok_reply(&mut client, target_display, route_path)?;
-            relay_tunnel(client, conn)
-                .map_err(|e| route_runtime_error(target_display, route_path, e))
+    let path = RoutePath(target, &route);
+    match &route {
+        RouteDecision::Remote { dial, .. } => {
+            let conn = crate::netstack::open_tcp_connection(dial)
+                .map_err(|e| reply_connect_error(&mut client, target, &path, e))?;
+            write_connect_ok_reply(&mut client, target, &path)?;
+            relay_tunnel(client, conn).map_err(|e| route_runtime_error(target, &path, e))
         }
-        RouteTransport::Direct(dial_target) => {
-            let conn = TcpStream::connect(&dial_target)
-                .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
-            relay_direct_with_reply(client, conn, target_display, route_path)
+        RouteDecision::Fallback { proxy, .. } => {
+            let result = match proxy {
+                Some(proxy) => proxy.connect(target),
+                None => target
+                    .connect()
+                    .map_err(|err| EcError::Runtime(err.to_string())),
+            };
+            let conn = result.map_err(|e| reply_connect_error(&mut client, target, &path, e))?;
+            write_connect_ok_reply(&mut client, target, &path)?;
+            relay_direct(client, conn).map_err(|e| route_runtime_error(target, &path, e))
         }
-        RouteTransport::Proxy(proxy, target) => {
-            let conn = connect_via_proxy(proxy, target.host(), target.port())
-                .map_err(|e| reply_connect_error(&mut client, target_display, route_path, e))?;
-            relay_direct_with_reply(client, conn, target_display, route_path)
-        }
-        RouteTransport::Unsupported(reason) => Err(reply_connect_error(
+        RouteDecision::Unavailable(_) => Err(reply_connect_error(
             &mut client,
-            target_display,
-            route_path,
-            reason.as_str(),
+            target,
+            &path,
+            "no route transport available",
         )),
     }
 }
 
 fn reply_connect_error(
     client: &mut TcpStream,
-    target_display: &str,
-    route_path: &str,
+    target_display: &(impl Display + ?Sized),
+    route_path: &(impl Display + ?Sized),
     err: impl std::fmt::Display,
 ) -> EcError {
     // Preserve the upstream cause even if the client has already disconnected.
@@ -382,8 +361,8 @@ fn reply_connect_error(
 }
 
 fn route_runtime_error(
-    target_display: &str,
-    route_path: &str,
+    target_display: &(impl Display + ?Sized),
+    route_path: &(impl Display + ?Sized),
     err: impl std::fmt::Display,
 ) -> EcError {
     let cause = crate::error::concise_error(err);
@@ -392,21 +371,11 @@ fn route_runtime_error(
 
 fn write_connect_ok_reply(
     client: &mut TcpStream,
-    target_display: &str,
-    route_path: &str,
+    target_display: &(impl Display + ?Sized),
+    route_path: &(impl Display + ?Sized),
 ) -> EcResult<()> {
     write_reply(client, SOCKS_REP_SUCCEEDED)
         .map_err(|e| route_runtime_error(target_display, route_path, e))
-}
-
-fn relay_direct_with_reply(
-    mut client: TcpStream,
-    conn: TcpStream,
-    target_display: &str,
-    route_path: &str,
-) -> EcResult<()> {
-    write_connect_ok_reply(&mut client, target_display, route_path)?;
-    relay_direct(client, conn).map_err(|e| route_runtime_error(target_display, route_path, e))
 }
 
 pub(crate) fn relay_tunnel(
@@ -576,19 +545,6 @@ fn is_expected_relay_io_error(err: &std::io::Error) -> bool {
     )
 }
 
-enum RouteTransport<'a> {
-    Tunnel(String),
-    Direct(String),
-    Proxy(&'a FallbackProxy, ConnectTarget),
-    Unsupported(String),
-}
-
-struct RouteDecision<'a> {
-    line: String,
-    path: String,
-    transport: RouteTransport<'a>,
-}
-
 enum ClientFailure {
     Request(EcError),
     Upstream(EcError),
@@ -603,26 +559,14 @@ impl ClientFailure {
     }
 }
 
-fn target_addr(target: &str) -> String {
-    if let Some((host, port)) = target.rsplit_once(':') {
-        return format_socket_target(host, port);
-    }
-    target.to_string()
-}
-
-fn is_ip_host(host: &str) -> bool {
-    host.trim().parse::<Ipv4Addr>().is_ok() || host.trim().parse::<Ipv6Addr>().is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFailure, RouteDecision, RouteTransport, SOCKS_REP_GENERAL_FAILURE,
-        SOCKS_REP_SUCCEEDED, describe_route_source, execute_route, handle_client,
-        is_expected_relay_io_error, is_retryable_accept_error, normalize_bind_addr, relay_direct,
-        relay_worker_result, route_decision_planner_error, route_decision_remote, target_addr,
+        ClientFailure, ConnectTarget, RouteDecision, RouteLine, RoutePath,
+        SOCKS_REP_GENERAL_FAILURE, SOCKS_REP_SUCCEEDED, describe_route_source, execute_route,
+        handle_client, is_expected_relay_io_error, is_retryable_accept_error, normalize_bind_addr,
+        relay_direct, relay_worker_result,
     };
-    use crate::error::EcError;
     use crate::route_table::RouteTable;
     use crate::routing::RouteSource;
     use crate::socks_proxy::parse_fallback_proxy;
@@ -924,21 +868,18 @@ mod tests {
 
     #[test]
     fn unavailable_tunnel_or_route_sends_failure_reply() {
-        for transport in [
-            RouteTransport::Tunnel("[::1]:443".to_string()),
-            RouteTransport::Unsupported("no route transport available".to_string()),
+        for route in [
+            RouteDecision::Remote {
+                dial: ConnectTarget::new("::1", 443),
+                rc_name: "unavailable",
+                source: RouteSource::RuleIp,
+                dns_lookup: None,
+            },
+            RouteDecision::Unavailable("no route transport available".to_string()),
         ] {
             let (client, relay) = tcp_pair();
             let server = thread::spawn(move || {
-                execute_route(
-                    relay,
-                    "example.test:443",
-                    RouteDecision {
-                        line: String::new(),
-                        path: "unavailable".to_string(),
-                        transport,
-                    },
-                )
+                execute_route(relay, &ConnectTarget::new("example.test", 443), route)
             });
             assert_connect_failure_reply(client);
             assert!(server.join().unwrap().is_err());
@@ -1211,24 +1152,82 @@ mod tests {
 
     #[test]
     fn direct_fallback_keeps_ipv6_target_bracketed() {
-        assert_eq!(target_addr("[2001:db8::1]:443"), "[2001:db8::1]:443");
+        let target = ConnectTarget::new("2001:db8::1", 443);
+        let route = RouteDecision::Fallback {
+            proxy: None,
+            reason: "IPv6 targets are fallback-only".into(),
+        };
+        assert_eq!(
+            RoutePath(&target, &route).to_string(),
+            "fallback -> direct; dial: [2001:db8::1]:443; reason: IPv6 targets are fallback-only"
+        );
     }
 
     #[test]
     fn remote_error_path_uses_consistent_key_separator() {
-        let route = route_decision_remote(
-            "example.com:443",
-            false,
-            "192.0.2.1:443".to_string(),
-            "Example".to_string(),
-            RouteSource::DnsMap,
-            None,
-        );
+        let target = ConnectTarget::new("example.com", 443);
+        let route = RouteDecision::Remote {
+            dial: ConnectTarget::new("192.0.2.1", 443),
+            rc_name: "Example",
+            source: RouteSource::DnsMap,
+            dns_lookup: None,
+        };
 
         assert_eq!(
-            route.path,
+            RoutePath(&target, &route).to_string(),
             "remote -> Example(192.0.2.1:443); source: dns-map"
         );
+    }
+
+    #[test]
+    fn route_lines_preserve_layout_and_styles_for_domain_ip_and_fallback() {
+        use crate::output::{self, RouteKind};
+        let target = ConnectTarget::new("example.com", 443);
+        let route = RouteDecision::Remote {
+            dial: ConnectTarget::new("192.0.2.1", 443),
+            rc_name: "Example",
+            source: RouteSource::DnsMap,
+            dns_lookup: None,
+        };
+        let arrow = output::weak(" -> ");
+        assert_eq!(
+            RouteLine(&target, &route).to_string(),
+            format!(
+                "example.com:443{arrow}{}{arrow}Example{}192.0.2.1:443{}",
+                output::route_label(RouteKind::Remote),
+                output::weak("("),
+                output::weak(")")
+            )
+        );
+        let target = ConnectTarget::new("192.0.2.1", 443);
+        assert_eq!(
+            RouteLine(&target, &route).to_string(),
+            format!(
+                "192.0.2.1:443{arrow}{}{arrow}Example",
+                output::route_label(RouteKind::Remote)
+            )
+        );
+        let target = ConnectTarget::new("2001:db8::1", 443);
+        let proxy = parse_fallback_proxy(Some("socks5h://127.0.0.1:1080"))
+            .unwrap()
+            .unwrap();
+        for proxy in [None, Some(&proxy)] {
+            let route = RouteDecision::Fallback {
+                proxy,
+                reason: "IPv6 targets are fallback-only".into(),
+            };
+            let suffix = match proxy {
+                Some(proxy) => output::value(&proxy.url).to_string(),
+                None => output::route_label(RouteKind::Direct).to_string(),
+            };
+            assert_eq!(
+                RouteLine(&target, &route).to_string(),
+                format!(
+                    "[2001:db8::1]:443{arrow}{}{arrow}{suffix}",
+                    output::route_label(RouteKind::Fallback)
+                )
+            );
+        }
     }
 
     #[test]
@@ -1239,20 +1238,19 @@ mod tests {
             describe_route_source(
                 RouteSource::CnameDnsMap,
                 Some(crate::dns_resolver::ResolveSource::Server(server))
-            ),
+            )
+            .to_string(),
             "cname-dns-map via dns-server(192.0.2.53:53)"
         );
     }
 
     #[test]
     fn planner_error_path_does_not_repeat_planner_unavailable() {
-        let route = route_decision_planner_error(
-            "example.com:443",
-            EcError::Runtime("route matcher is not initialized".to_string()),
-        );
+        let target = ConnectTarget::new("example.com", 443);
+        let route = RouteDecision::Unavailable("route matcher is not initialized".to_string());
 
         assert_eq!(
-            route.path,
+            RoutePath(&target, &route).to_string(),
             "fallback -> unavailable; reason: route matcher is not initialized"
         );
     }

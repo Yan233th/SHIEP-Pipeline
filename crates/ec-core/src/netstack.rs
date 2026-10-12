@@ -1,3 +1,4 @@
+use crate::endpoint::{ConnectTarget, TargetHost};
 use crate::error::{EcError, EcResult};
 use crate::netstack_device::TunnelDevice;
 use crate::output::{self, Scope};
@@ -6,7 +7,7 @@ use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use std::collections::HashMap;
-use std::net::{SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::thread;
@@ -43,7 +44,7 @@ pub(crate) fn start_runtime(
     Ok(ingress)
 }
 
-pub fn open_tcp_connection(target: &str) -> EcResult<TunnelTcpConnection> {
+pub fn open_tcp_connection(target: &ConnectTarget) -> EcResult<TunnelTcpConnection> {
     let control = CONTROL_TX
         .get()
         .ok_or_else(|| EcError::Runtime("netstack runtime is not started".to_string()))?
@@ -688,8 +689,17 @@ fn pump_uplink_reads(socket: &mut tcp::Socket, conn: &mut ConnectionState) {
     }
 }
 
-fn resolve_ipv4_target(target: &str) -> EcResult<SocketAddrV4> {
-    let mut addrs = target
+fn resolve_ipv4_target(target: &ConnectTarget) -> EcResult<SocketAddrV4> {
+    let host = match target.host() {
+        TargetHost::Ip(IpAddr::V4(ip)) => return Ok(SocketAddrV4::new(*ip, target.port())),
+        TargetHost::Ip(IpAddr::V6(_)) => {
+            return Err(EcError::Runtime(format!(
+                "no ipv4 address resolved for {target}"
+            )));
+        }
+        TargetHost::Domain(host) => host,
+    };
+    let mut addrs = (host.as_str(), target.port())
         .to_socket_addrs()
         .map_err(|e| EcError::Runtime(format!("resolve target failed: {target}: {e}")))?;
     addrs
@@ -752,6 +762,19 @@ mod tests {
     use std::time::Duration;
 
     const TEST_CONN_ID: u64 = 7;
+
+    #[test]
+    fn tunnel_target_resolution_accepts_ipv4_and_system_hostnames_only() {
+        use crate::endpoint::ConnectTarget;
+        assert_eq!(
+            super::resolve_ipv4_target(&ConnectTarget::new("192.0.2.1", 443)).unwrap(),
+            "192.0.2.1:443".parse().unwrap()
+        );
+        let local = super::resolve_ipv4_target(&ConnectTarget::new("localhost", 8080)).unwrap();
+        assert!(local.ip().is_loopback());
+        assert_eq!(local.port(), 8080);
+        assert!(super::resolve_ipv4_target(&ConnectTarget::new("2001:db8::1", 443)).is_err());
+    }
 
     fn test_sender() -> (
         TunnelTcpSender,

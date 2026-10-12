@@ -1,7 +1,9 @@
+use crate::endpoint::{ConnectTarget, TargetHost};
 use crate::error::{EcError, EcResult};
 use crate::route_table::{PortRange, RouteRule, RouteTable};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -18,17 +20,16 @@ pub struct RouteInstallSummary {
 }
 
 #[derive(Debug, Clone)]
-pub enum RoutePlan {
+pub enum RoutePlan<'a> {
     Remote {
-        dial: String,
+        dial: ConnectTarget,
         rc_id: i32,
-        rc_name: String,
+        rc_name: &'a str,
         source: RouteSource,
         dns_lookup: Option<crate::dns_resolver::ResolveSource>,
     },
     Fallback {
-        target: String,
-        reason: String,
+        reason: Cow<'static, str>,
     },
 }
 
@@ -82,22 +83,22 @@ pub fn install_tunnel_fallback() -> EcResult<()> {
     Ok(())
 }
 
-pub fn plan_target(host: &str, port: u16) -> EcResult<RoutePlan> {
+pub fn plan_target(target: &ConnectTarget) -> EcResult<RoutePlan<'static>> {
     let mode = ROUTER
         .get()
         .ok_or_else(|| EcError::Runtime(ROUTER_NOT_INITIALIZED.to_string()))?;
-    plan_from_mode(mode, host, port)
+    plan_from_mode(mode, target)
 }
 
-fn plan_from_mode(mode: &RouteMode, host: &str, port: u16) -> EcResult<RoutePlan> {
+fn plan_from_mode<'a>(mode: &'a RouteMode, target: &ConnectTarget) -> EcResult<RoutePlan<'a>> {
     match mode {
-        RouteMode::Matcher(matcher) => Ok(matcher.plan(host, port)),
-        RouteMode::TunnelFallback => match parse_target(host) {
-            TargetKind::Ipv6(ip) => Ok(plan_ipv6_fallback(ip, port)),
+        RouteMode::Matcher(matcher) => Ok(matcher.plan_target(target)),
+        RouteMode::TunnelFallback => match parse_target(target.host()) {
+            TargetKind::Ipv6 => Ok(plan_ipv6_fallback()),
             _ => Ok(RoutePlan::Remote {
-                dial: format!("{host}:{port}"),
+                dial: target.clone(),
                 rc_id: 0,
-                rc_name: "route-table-unavailable".to_string(),
+                rc_name: "route-table-unavailable",
                 source: RouteSource::RouteTableUnavailable,
                 dns_lookup: None,
             }),
@@ -146,10 +147,10 @@ enum HostMatcher {
 }
 
 #[derive(Debug, Clone)]
-enum TargetKind {
-    Domain(String),
+enum TargetKind<'a> {
+    Domain(Cow<'a, str>),
     Ipv4(Ipv4Addr),
-    Ipv6(Ipv6Addr),
+    Ipv6,
 }
 
 #[derive(Debug, Default)]
@@ -189,13 +190,19 @@ impl RouteMatcher {
         })
     }
 
-    fn plan(&self, host: &str, port: u16) -> RoutePlan {
-        let target = parse_target(host);
-        if let TargetKind::Ipv6(ip) = target {
-            return plan_ipv6_fallback(ip, port);
+    #[cfg(test)]
+    fn plan(&self, host: &str, port: u16) -> RoutePlan<'_> {
+        self.plan_target(&ConnectTarget::new(host, port))
+    }
+
+    fn plan_target(&self, request: &ConnectTarget) -> RoutePlan<'_> {
+        let port = request.port();
+        let target = parse_target(request.host());
+        if let TargetKind::Ipv6 = target {
+            return plan_ipv6_fallback();
         }
         if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
-            return self.plan_remote_with_rule(rule, host, port, &target, None);
+            return self.plan_remote_with_rule(rule, port, &target, None);
         }
 
         if let TargetKind::Domain(domain) = &target
@@ -205,53 +212,50 @@ impl RouteMatcher {
         }
 
         if let TargetKind::Domain(domain) = &target
-            && let Some(plan) = self.plan_dnsserver_derived_rules(host, port, domain)
+            && let Some(plan) = self.plan_dnsserver_derived_rules(port, domain)
         {
             return plan;
         }
 
         RoutePlan::Fallback {
-            target: format!("{host}:{port}"),
-            reason: "no whitelist rule matched".to_string(),
+            reason: "no whitelist rule matched".into(),
         }
     }
 
-    fn plan_remote_with_rule(
+    fn plan_remote_with_rule<'a>(
         &self,
-        rule: &CompiledRule,
-        host: &str,
+        rule: &'a CompiledRule,
         port: u16,
         target: &TargetKind,
         resolved: Option<crate::dns_resolver::ResolveResult>,
-    ) -> RoutePlan {
+    ) -> RoutePlan<'a> {
         match target {
             TargetKind::Ipv4(ip) => RoutePlan::Remote {
-                dial: format!("{ip}:{port}"),
+                dial: ConnectTarget::new(TargetHost::Ip((*ip).into()), port),
                 rc_id: rule.rc_id,
-                rc_name: rule.rc_name.clone(),
+                rc_name: &rule.rc_name,
                 source: RouteSource::RuleIp,
                 dns_lookup: None,
             },
-            TargetKind::Ipv6(ip) => plan_ipv6_fallback(*ip, port),
+            TargetKind::Ipv6 => plan_ipv6_fallback(),
             TargetKind::Domain(domain) => {
                 if let Some(ip) = self
                     .dns_map
                     .get(&rule.rc_id)
-                    .and_then(|domains| domains.get(domain))
+                    .and_then(|domains| domains.get(domain.as_ref()))
                 {
                     return RoutePlan::Remote {
-                        dial: format!("{ip}:{port}"),
+                        dial: ConnectTarget::new(TargetHost::Ip((*ip).into()), port),
                         rc_id: rule.rc_id,
-                        rc_name: rule.rc_name.clone(),
+                        rc_name: &rule.rc_name,
                         source: RouteSource::DnsMap,
                         dns_lookup: None,
                     };
                 }
                 if resolved.is_none() && self.dns_servers.is_empty() {
                     return RoutePlan::Fallback {
-                        target: format!("{host}:{port}"),
                         reason: "hostname matched a route rule but dns.data entry is missing and DNS servers are unavailable"
-                            .to_string(),
+                            .into(),
                     };
                 }
 
@@ -262,41 +266,35 @@ impl RouteMatcher {
                     Ok(resolved) => {
                         let dns_lookup = resolved.source;
                         RoutePlan::Remote {
-                            dial: format!("{}:{port}", resolved.ip),
+                            dial: ConnectTarget::new(TargetHost::Ip(resolved.ip.into()), port),
                             rc_id: rule.rc_id,
-                            rc_name: rule.rc_name.clone(),
+                            rc_name: &rule.rc_name,
                             source: RouteSource::DnsServer,
                             dns_lookup: Some(dns_lookup),
                         }
                     }
                     Err(err) => RoutePlan::Fallback {
-                        target: format!("{host}:{port}"),
                         reason: format!(
                             "hostname matched a route rule but dns.data entry is missing and DNS lookup failed: {}",
                             crate::error::concise_error(err)
-                        ),
+                        ).into(),
                     },
                 }
             }
         }
     }
 
-    fn plan_dns_data_ip_rule(&self, port: u16, domain: &str) -> Option<RoutePlan> {
+    fn plan_dns_data_ip_rule(&self, port: u16, domain: &str) -> Option<RoutePlan<'_>> {
         let ips = self.dns_exact.get(domain)?;
         self.plan_from_resolved_ips(port, ips, RouteSource::DnsDataIpRule, None)
     }
 
-    fn plan_dnsserver_derived_rules(
-        &self,
-        host: &str,
-        port: u16,
-        domain: &str,
-    ) -> Option<RoutePlan> {
+    fn plan_dnsserver_derived_rules(&self, port: u16, domain: &str) -> Option<RoutePlan<'_>> {
         if self.dns_servers.is_empty() || !self.is_trusted_dns_domain(domain) {
             return None;
         }
         let resolved = crate::dns_resolver::resolve_lookup(domain, &self.dns_servers).ok()?;
-        if let Some(plan) = self.plan_from_cname_aliases(host, port, &resolved) {
+        if let Some(plan) = self.plan_from_cname_aliases(port, &resolved) {
             return Some(plan);
         }
         let dns_lookup = resolved.source;
@@ -310,10 +308,9 @@ impl RouteMatcher {
 
     fn plan_from_cname_aliases(
         &self,
-        host: &str,
         port: u16,
         resolved: &crate::dns_resolver::LookupResolveResult,
-    ) -> Option<RoutePlan> {
+    ) -> Option<RoutePlan<'_>> {
         for alias in &resolved.aliases {
             let alias = normalize_domain(alias);
             if alias.is_empty() || Ipv4Addr::from_str(&alias).is_ok() {
@@ -322,7 +319,7 @@ impl RouteMatcher {
             let target = TargetKind::Domain(alias);
             if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
                 return Some(
-                    self.plan_remote_with_cname_rule(rule, host, port, &target, resolved)
+                    self.plan_remote_with_cname_rule(rule, port, &target, resolved)
                         .with_dns_lookup_if_absent(resolved.source),
                 );
             }
@@ -349,14 +346,14 @@ impl RouteMatcher {
         ips: &[Ipv4Addr],
         source: RouteSource,
         dns_lookup: Option<crate::dns_resolver::ResolveSource>,
-    ) -> Option<RoutePlan> {
+    ) -> Option<RoutePlan<'_>> {
         for ip in ips {
             let target = TargetKind::Ipv4(*ip);
             if let Some(rule) = self.rule_index.find_first_match(&self.rules, &target, port) {
                 return Some(RoutePlan::Remote {
-                    dial: format!("{ip}:{port}"),
+                    dial: ConnectTarget::new(TargetHost::Ip((*ip).into()), port),
                     rc_id: rule.rc_id,
-                    rc_name: rule.rc_name.clone(),
+                    rc_name: &rule.rc_name,
                     source,
                     dns_lookup,
                 });
@@ -365,14 +362,13 @@ impl RouteMatcher {
         None
     }
 
-    fn plan_remote_with_cname_rule(
+    fn plan_remote_with_cname_rule<'a>(
         &self,
-        rule: &CompiledRule,
-        host: &str,
+        rule: &'a CompiledRule,
         port: u16,
         target: &TargetKind,
         resolved: &crate::dns_resolver::LookupResolveResult,
-    ) -> RoutePlan {
+    ) -> RoutePlan<'a> {
         let address = resolved
             .ips
             .first()
@@ -380,7 +376,7 @@ impl RouteMatcher {
                 ip,
                 source: resolved.source,
             });
-        match self.plan_remote_with_rule(rule, host, port, target, address) {
+        match self.plan_remote_with_rule(rule, port, target, address) {
             RoutePlan::Remote {
                 dial,
                 rc_id,
@@ -399,7 +395,7 @@ impl RouteMatcher {
     }
 }
 
-impl RoutePlan {
+impl RoutePlan<'_> {
     fn with_dns_lookup_if_absent(mut self, source: crate::dns_resolver::ResolveSource) -> Self {
         if let Self::Remote { dns_lookup, .. } = &mut self
             && dns_lookup.is_none()
@@ -525,7 +521,7 @@ impl RuleIndex {
         match target {
             TargetKind::Domain(domain) => self
                 .domain
-                .get(domain)
+                .get(domain.as_ref())
                 .and_then(|ids| {
                     ids.iter()
                         .find_map(|&idx| rule_matches(&rules[idx], port).then_some(idx))
@@ -558,7 +554,7 @@ impl RuleIndex {
                 }
                 best_idx.map(|idx| &rules[idx])
             }
-            TargetKind::Ipv6(_) => None,
+            TargetKind::Ipv6 => None,
         }
     }
 }
@@ -617,7 +613,7 @@ fn build_dns_indexes(raw_dns_records: Vec<crate::route_table::DnsRecord>) -> Dns
     let mut seen_dns = HashSet::<(i32, String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
     let mut seen_exact = HashSet::<(String, Ipv4Addr)>::with_capacity(raw_dns_records.len());
     for rec in raw_dns_records {
-        let host = normalize_domain(&rec.host);
+        let host = normalize_domain(&rec.host).into_owned();
         if host.is_empty() {
             continue;
         }
@@ -702,7 +698,7 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
         if domain.is_empty() {
             return None;
         }
-        HostMatcher::Domain(domain)
+        HostMatcher::Domain(domain.into_owned())
     };
 
     Some(CompiledRule {
@@ -714,26 +710,27 @@ fn compile_rule(rule: RouteRule) -> Option<CompiledRule> {
     })
 }
 
-fn parse_target(host: &str) -> TargetKind {
-    let host = host.trim();
-    if let Ok(ip) = Ipv4Addr::from_str(host) {
-        TargetKind::Ipv4(ip)
-    } else if let Ok(ip) = Ipv6Addr::from_str(host) {
-        TargetKind::Ipv6(ip)
-    } else {
-        TargetKind::Domain(normalize_domain(host))
+fn parse_target(host: &TargetHost) -> TargetKind<'_> {
+    match host {
+        TargetHost::Ip(IpAddr::V4(ip)) => TargetKind::Ipv4(*ip),
+        TargetHost::Ip(IpAddr::V6(_)) => TargetKind::Ipv6,
+        TargetHost::Domain(host) => TargetKind::Domain(normalize_domain(host)),
     }
 }
 
-fn plan_ipv6_fallback(ip: Ipv6Addr, port: u16) -> RoutePlan {
+fn plan_ipv6_fallback() -> RoutePlan<'static> {
     RoutePlan::Fallback {
-        target: SocketAddr::new(IpAddr::V6(ip), port).to_string(),
-        reason: "IPv6 targets are fallback-only".to_string(),
+        reason: "IPv6 targets are fallback-only".into(),
     }
 }
 
-fn normalize_domain(host: &str) -> String {
-    host.trim().trim_end_matches('.').to_ascii_lowercase()
+fn normalize_domain(host: &str) -> Cow<'_, str> {
+    let host = host.trim().trim_end_matches('.');
+    if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
+    }
 }
 
 fn port_matches(range: PortRange, port: u16) -> bool {
@@ -789,7 +786,7 @@ mod tests {
                 dns_lookup,
                 ..
             } => {
-                assert_eq!(dial, "10.166.35.11:443");
+                assert_eq!(dial.to_string(), "10.166.35.11:443");
                 assert_eq!(rc_id, 205);
                 assert_eq!(source, RouteSource::DnsMap);
                 assert_eq!(dns_lookup, None);
@@ -872,8 +869,7 @@ mod tests {
 
         let plan = matcher.plan("github.com", 443);
         match plan {
-            RoutePlan::Fallback { target, reason } => {
-                assert_eq!(target, "github.com:443");
+            RoutePlan::Fallback { reason } => {
                 assert_eq!(reason, "no whitelist rule matched");
             }
             _ => panic!("expected fallback plan"),
@@ -882,7 +878,12 @@ mod tests {
 
     #[test]
     fn tunnel_fallback_mode_routes_non_ipv6_targets_remote() {
-        let plan = plan_from_mode(&RouteMode::TunnelFallback, "example.invalid", 443).unwrap();
+        let mode = RouteMode::TunnelFallback;
+        let plan = plan_from_mode(
+            &mode,
+            &crate::endpoint::ConnectTarget::new("example.invalid", 443),
+        )
+        .unwrap();
         match plan {
             RoutePlan::Remote {
                 dial,
@@ -891,7 +892,7 @@ mod tests {
                 source,
                 ..
             } => {
-                assert_eq!(dial, "example.invalid:443");
+                assert_eq!(dial.to_string(), "example.invalid:443");
                 assert_eq!(rc_id, 0);
                 assert_eq!(rc_name, "route-table-unavailable");
                 assert_eq!(source, RouteSource::RouteTableUnavailable);
@@ -920,8 +921,7 @@ mod tests {
         let matcher = RouteMatcher::from_table(table).unwrap();
         let plan = matcher.plan("2001:db8::1", 443);
         match plan {
-            RoutePlan::Fallback { target, reason } => {
-                assert_eq!(target, "[2001:db8::1]:443");
+            RoutePlan::Fallback { reason } => {
                 assert_eq!(reason, "IPv6 targets are fallback-only");
             }
             _ => panic!("expected IPv6 fallback plan"),
@@ -930,10 +930,14 @@ mod tests {
 
     #[test]
     fn tunnel_fallback_mode_keeps_ipv6_out_of_tunnel() {
-        let plan = plan_from_mode(&RouteMode::TunnelFallback, "2001:db8::1", 443).unwrap();
+        let mode = RouteMode::TunnelFallback;
+        let plan = plan_from_mode(
+            &mode,
+            &crate::endpoint::ConnectTarget::new("2001:db8::1", 443),
+        )
+        .unwrap();
         match plan {
-            RoutePlan::Fallback { target, reason } => {
-                assert_eq!(target, "[2001:db8::1]:443");
+            RoutePlan::Fallback { reason } => {
                 assert_eq!(reason, "IPv6 targets are fallback-only");
             }
             _ => panic!("expected IPv6 fallback plan"),
@@ -991,7 +995,7 @@ mod tests {
                 source,
                 ..
             } => {
-                assert_eq!(dial, "10.166.64.9:10002");
+                assert_eq!(dial.to_string(), "10.166.64.9:10002");
                 assert_eq!(rc_id, 301);
                 assert_eq!(source, RouteSource::DnsDataIpRule);
             }
@@ -1079,7 +1083,6 @@ mod tests {
         let matcher = RouteMatcher::from_table(table).unwrap();
         let plan = matcher
             .plan_from_cname_aliases(
-                "estudent.shiep.edu.cn",
                 443,
                 &crate::dns_resolver::LookupResolveResult {
                     aliases: vec!["lgwf0-46.shiep.edu.cn".to_string()],
@@ -1098,7 +1101,7 @@ mod tests {
                 dns_lookup,
                 ..
             } => {
-                assert_eq!(dial, "10.166.64.6:443");
+                assert_eq!(dial.to_string(), "10.166.64.6:443");
                 assert_eq!(rc_id, 150);
                 assert_eq!(source, RouteSource::CnameDnsMap);
                 assert_eq!(
@@ -1131,7 +1134,6 @@ mod tests {
         };
         let matcher = RouteMatcher::from_table(table).unwrap();
         let plan = matcher.plan_from_cname_aliases(
-            "estudent.shiep.edu.cn",
             443,
             &crate::dns_resolver::LookupResolveResult {
                 aliases: vec!["10.166.64.6".to_string()],
@@ -1236,7 +1238,7 @@ mod tests {
             assert_eq!(rc_id, 1);
             assert_eq!(dns_lookup, Some(ResolveSource::Server(server)));
             assert_eq!(
-                dial,
+                dial.to_string(),
                 if mapped {
                     "192.0.2.88:443"
                 } else {
@@ -1269,21 +1271,19 @@ mod tests {
             ips: vec!["192.0.2.44".parse().unwrap()],
             source: ResolveSource::Cache,
         };
-        let plan = matcher
-            .plan_from_cname_aliases("entry.example.test", 443, &result)
-            .unwrap();
+        let plan = matcher.plan_from_cname_aliases(443, &result).unwrap();
         assert!(matches!(plan, RoutePlan::Remote {
             dial, source: RouteSource::CnameDnsServer, dns_lookup: Some(ResolveSource::Cache), ..
-        } if dial == "192.0.2.44:443"));
+        } if dial.to_string() == "192.0.2.44:443"));
     }
 
     #[test]
     fn cname_lookup_does_not_replace_a_more_direct_dns_source() {
         let inner_server = "192.0.2.53:53".parse().unwrap();
         let plan = RoutePlan::Remote {
-            dial: "10.166.64.6:443".to_string(),
+            dial: crate::endpoint::ConnectTarget::new("10.166.64.6", 443),
             rc_id: 150,
-            rc_name: "SUEP-WAF".to_string(),
+            rc_name: "SUEP-WAF",
             source: RouteSource::CnameDnsServer,
             dns_lookup: Some(crate::dns_resolver::ResolveSource::Server(inner_server)),
         }
@@ -1329,7 +1329,7 @@ mod tests {
                 source,
                 ..
             } => {
-                assert_eq!(dial, "10.50.2.206:80");
+                assert_eq!(dial.to_string(), "10.50.2.206:80");
                 assert_eq!(rc_id, 302);
                 assert_eq!(source, RouteSource::DnsServerIpRule);
             }
@@ -1355,7 +1355,7 @@ mod tests {
         let plan = matcher.plan("10.50.2.206", 80);
         match plan {
             RoutePlan::Remote { dial, source, .. } => {
-                assert_eq!(dial, "10.50.2.206:80");
+                assert_eq!(dial.to_string(), "10.50.2.206:80");
                 assert_eq!(source, RouteSource::RuleIp);
             }
             _ => panic!("expected remote plan"),
@@ -1426,7 +1426,7 @@ mod tests {
         let RoutePlan::Remote { dial, .. } = matcher.plan("ids.shiep.edu.cn", 443) else {
             panic!("expected the first scoped address to remain the remote target");
         };
-        assert_eq!(dial, "10.166.35.11:443");
+        assert_eq!(dial.to_string(), "10.166.35.11:443");
         let exact_ips = matcher.dns_exact.get("ids.shiep.edu.cn").unwrap();
         assert_eq!(exact_ips.len(), 2);
         assert_eq!(exact_ips[0].to_string(), "10.166.35.11");
@@ -1610,7 +1610,7 @@ mod tests {
                 source,
                 ..
             } => {
-                assert_eq!(dial, "10.50.2.206:443");
+                assert_eq!(dial.to_string(), "10.50.2.206:443");
                 assert_eq!(rc_id, 336);
                 assert_eq!(source, RouteSource::RuleIp);
             }
@@ -1645,7 +1645,7 @@ mod tests {
                 source,
                 ..
             } => {
-                assert_eq!(dial, "10.50.2.206:443");
+                assert_eq!(dial.to_string(), "10.50.2.206:443");
                 assert_eq!(rc_id, 337);
                 assert_eq!(source, RouteSource::DnsDataIpRule);
             }
@@ -1706,7 +1706,7 @@ mod tests {
         match plan {
             RoutePlan::Remote { rc_id, dial, .. } => {
                 assert_eq!(rc_id, 1);
-                assert_eq!(dial, "10.50.2.206:80");
+                assert_eq!(dial.to_string(), "10.50.2.206:80");
             }
             _ => panic!("expected remote plan"),
         }

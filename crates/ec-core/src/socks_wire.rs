@@ -1,6 +1,7 @@
+use crate::endpoint::{ConnectTarget, TargetHost};
 use crate::error::{EcError, EcResult};
 use std::io::{Read, Write};
-use std::net::{Ipv6Addr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 
 const SOCKS_VERSION_5: u8 = 0x05;
 const SOCKS_METHOD_NO_AUTH: u8 = 0x00;
@@ -86,7 +87,7 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
             client
                 .read_exact(&mut ip)
                 .map_err(|e| EcError::Runtime(format!("read ipv4 failed: {e}")))?;
-            Ok(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]))
+            Ok(TargetHost::Ip(IpAddr::V4(Ipv4Addr::from(ip))))
         }
         SOCKS_ATYP_DOMAIN => {
             let mut len = [0u8; 1];
@@ -99,13 +100,14 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
                 .map_err(|e| EcError::Runtime(format!("read domain failed: {e}")))?;
             String::from_utf8(domain)
                 .map_err(|_| EcError::Runtime("invalid socks domain: expected UTF-8".to_string()))
+                .map(TargetHost::Domain)
         }
         SOCKS_ATYP_IPV6 => {
             let mut ip = [0u8; 16];
             client
                 .read_exact(&mut ip)
                 .map_err(|e| EcError::Runtime(format!("read ipv6 failed: {e}")))?;
-            Ok(Ipv6Addr::from(ip).to_string())
+            Ok(TargetHost::Ip(IpAddr::V6(Ipv6Addr::from(ip))))
         }
         atyp => {
             return Err(EcError::Runtime(format!(
@@ -121,7 +123,7 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
     let port = u16::from_be_bytes(port_buf);
     let host = host?;
     // A domain is reused in route logs and HTTP CONNECT authority fields.
-    if atyp == SOCKS_ATYP_DOMAIN
+    if let TargetHost::Domain(host) = &host
         && (host.is_empty()
             || host.chars().any(|c| {
                 c.is_control()
@@ -133,7 +135,12 @@ fn read_request_target(client: &mut TcpStream, atyp: u8) -> EcResult<ConnectTarg
             "invalid socks domain: empty name or forbidden character".to_string(),
         ));
     }
-    Ok(ConnectTarget { host, port })
+    // Numeric domain-form targets retain the existing IP routing semantics.
+    let host = match host {
+        TargetHost::Domain(host) => TargetHost::from(host),
+        host => host,
+    };
+    Ok(ConnectTarget::new(host, port))
 }
 
 pub(crate) fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
@@ -152,15 +159,6 @@ pub(crate) fn write_reply(client: &mut TcpStream, rep: u8) -> EcResult<()> {
     client
         .write_all(&reply)
         .map_err(|e| EcError::Runtime(format!("socks reply write failed: {e}")))
-}
-
-pub(crate) fn format_socket_target(host: &str, port: impl std::fmt::Display) -> String {
-    let h = host.trim();
-    if h.parse::<Ipv6Addr>().is_ok() {
-        format!("[{h}]:{port}")
-    } else {
-        format!("{h}:{port}")
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,33 +193,9 @@ pub(crate) struct SocksRequest {
     pub(crate) target: ConnectTarget,
 }
 
-#[derive(Clone)]
-pub(crate) struct ConnectTarget {
-    host: String,
-    port: u16,
-}
-
-impl ConnectTarget {
-    pub(crate) fn host(&self) -> &str {
-        &self.host
-    }
-
-    pub(crate) fn port(&self) -> u16 {
-        self.port
-    }
-}
-
-impl std::fmt::Display for ConnectTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&format_socket_target(&self.host, self.port))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ConnectTarget, SocksCommand, SocksRequest, format_socket_target, read_socks_request,
-    };
+    use super::{ConnectTarget, SocksCommand, SocksRequest, read_socks_request};
     use crate::error::{EcResult, concise_error};
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -299,7 +273,7 @@ mod tests {
             let (result, reply) = parse_request(&domain_request(domain.as_bytes()));
             let request = result.unwrap();
             assert_eq!(request.command, SocksCommand::Connect);
-            assert_eq!(request.target.host(), domain);
+            assert_eq!(request.target.host().to_string(), domain);
             assert_eq!(request.target.port(), 443);
             assert!(reply.is_empty());
         }
@@ -352,12 +326,12 @@ mod tests {
 
     #[test]
     fn ipv6_targets_use_bracketed_socket_format() {
-        let target = ConnectTarget {
-            host: "2001:db8::1".to_string(),
-            port: 443,
-        };
+        let target = ConnectTarget::new("2001:db8::1", 443);
 
         assert_eq!(target.to_string(), "[2001:db8::1]:443");
-        assert_eq!(format_socket_target("example.com", 443), "example.com:443");
+        assert_eq!(
+            ConnectTarget::new("example.com", 443).to_string(),
+            "example.com:443"
+        );
     }
 }

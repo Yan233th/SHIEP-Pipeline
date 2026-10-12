@@ -1,4 +1,78 @@
 use crate::error::{EcError, EcResult};
+use std::fmt::{self, Display};
+use std::net::{IpAddr, SocketAddr, TcpStream};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TargetHost {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+impl From<String> for TargetHost {
+    fn from(host: String) -> Self {
+        match host.trim().parse() {
+            Ok(ip) => Self::Ip(ip),
+            Err(_) => Self::Domain(host),
+        }
+    }
+}
+
+impl From<&str> for TargetHost {
+    fn from(host: &str) -> Self {
+        match host.trim().parse() {
+            Ok(ip) => Self::Ip(ip),
+            Err(_) => Self::Domain(host.to_string()),
+        }
+    }
+}
+
+impl Display for TargetHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ip(ip) => ip.fmt(f),
+            Self::Domain(host) => f.write_str(host),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectTarget {
+    host: TargetHost,
+    port: u16,
+}
+
+impl ConnectTarget {
+    pub(crate) fn new(host: impl Into<TargetHost>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+        }
+    }
+
+    pub(crate) fn host(&self) -> &TargetHost {
+        &self.host
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn connect(&self) -> std::io::Result<TcpStream> {
+        match &self.host {
+            TargetHost::Ip(ip) => TcpStream::connect(SocketAddr::new(*ip, self.port)),
+            TargetHost::Domain(host) => TcpStream::connect((host.as_str(), self.port)),
+        }
+    }
+}
+
+impl Display for ConnectTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.host {
+            TargetHost::Ip(ip) => SocketAddr::new(*ip, self.port).fmt(f),
+            TargetHost::Domain(host) => write!(f, "{}:{}", host.trim(), self.port),
+        }
+    }
+}
 
 const DEFAULT_TLS_PORT: u16 = 443;
 

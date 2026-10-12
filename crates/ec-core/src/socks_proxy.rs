@@ -1,8 +1,8 @@
+use crate::endpoint::{ConnectTarget, TargetHost};
 use crate::error::{EcError, EcResult};
 use crate::output;
-use crate::socks_wire::format_socket_target;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV6, TcpStream};
+use std::net::{IpAddr, SocketAddrV6, TcpStream};
 use std::time::Duration;
 
 const HTTP_PROXY_HEAD_MAX_SIZE: usize = 16 * 1024;
@@ -34,20 +34,12 @@ enum FallbackProxyKind {
 }
 
 impl FallbackProxy {
-    pub(crate) fn connect(&self, host: &str, port: u16) -> EcResult<TcpStream> {
+    pub(crate) fn connect(&self, target: &ConnectTarget) -> EcResult<TcpStream> {
         match self.kind {
-            FallbackProxyKind::Socks5 => connect_via_socks5_proxy(&self.addr, host, port),
-            FallbackProxyKind::Http => connect_via_http_connect_proxy(&self.addr, host, port),
+            FallbackProxyKind::Socks5 => connect_via_socks5_proxy(&self.addr, target),
+            FallbackProxyKind::Http => connect_via_http_connect_proxy(&self.addr, target),
         }
     }
-}
-
-pub(crate) fn connect_via_proxy(
-    proxy: &FallbackProxy,
-    host: &str,
-    port: u16,
-) -> EcResult<TcpStream> {
-    proxy.connect(host, port)
 }
 
 pub(crate) fn parse_fallback_proxy(raw: Option<&str>) -> EcResult<Option<FallbackProxy>> {
@@ -120,38 +112,36 @@ fn parse_fallback_proxy_scheme(scheme: &str) -> EcResult<FallbackProxyKind> {
     }
 }
 
-fn connect_via_socks5_proxy(proxy_addr: &str, host: &str, port: u16) -> EcResult<TcpStream> {
-    connect_via_socks5_proxy_with_timeout(proxy_addr, host, port, PROXY_HANDSHAKE_TIMEOUT)
+fn connect_via_socks5_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
+    connect_via_socks5_proxy_with_timeout(proxy_addr, target, PROXY_HANDSHAKE_TIMEOUT)
 }
 
 fn connect_via_socks5_proxy_with_timeout(
     proxy_addr: &str,
-    host: &str,
-    port: u16,
+    target: &ConnectTarget,
     timeout: Duration,
 ) -> EcResult<TcpStream> {
     let mut stream = connect_tcp_stream(proxy_addr, "fallback proxy")?;
     set_proxy_handshake_timeout(&stream, Some(timeout))?;
     negotiate_socks5_proxy_no_auth(&mut stream)?;
-    write_socks5_connect_request(&mut stream, host, port)?;
+    write_socks5_connect_request(&mut stream, target)?;
     read_socks5_connect_reply(&mut stream)?;
     set_proxy_handshake_timeout(&stream, None)?;
     Ok(stream)
 }
 
-fn connect_via_http_connect_proxy(proxy_addr: &str, host: &str, port: u16) -> EcResult<TcpStream> {
-    connect_via_http_connect_proxy_with_timeout(proxy_addr, host, port, PROXY_HANDSHAKE_TIMEOUT)
+fn connect_via_http_connect_proxy(proxy_addr: &str, target: &ConnectTarget) -> EcResult<TcpStream> {
+    connect_via_http_connect_proxy_with_timeout(proxy_addr, target, PROXY_HANDSHAKE_TIMEOUT)
 }
 
 fn connect_via_http_connect_proxy_with_timeout(
     proxy_addr: &str,
-    host: &str,
-    port: u16,
+    target: &ConnectTarget,
     timeout: Duration,
 ) -> EcResult<TcpStream> {
     let mut stream = connect_tcp_stream(proxy_addr, "fallback http proxy")?;
     set_proxy_handshake_timeout(&stream, Some(timeout))?;
-    let request = build_http_connect_request(host, port);
+    let request = build_http_connect_request(target);
     stream
         .write_all(request.as_bytes())
         .map_err(|e| EcError::Runtime(format!("http proxy connect request write failed: {e}")))?;
@@ -161,8 +151,7 @@ fn connect_via_http_connect_proxy_with_timeout(
     Ok(stream)
 }
 
-fn build_http_connect_request(host: &str, port: u16) -> String {
-    let authority = format_socket_target(host, port);
+fn build_http_connect_request(authority: &ConnectTarget) -> String {
     format!(
         "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nConnection: keep-alive\r\nProxy-Connection: keep-alive\r\n\r\n"
     )
@@ -212,13 +201,13 @@ fn negotiate_socks5_proxy_no_auth(stream: &mut TcpStream) -> EcResult<()> {
     Ok(())
 }
 
-fn write_socks5_connect_request(stream: &mut TcpStream, host: &str, port: u16) -> EcResult<()> {
+fn write_socks5_connect_request(stream: &mut TcpStream, target: &ConnectTarget) -> EcResult<()> {
     let mut req = Vec::with_capacity(300);
     req.push(SOCKS_VERSION_5);
     req.push(SOCKS_CMD_CONNECT);
     req.push(SOCKS_RSV);
-    append_socks5_addr(&mut req, host)?;
-    req.extend_from_slice(&port.to_be_bytes());
+    append_socks5_addr(&mut req, target.host())?;
+    req.extend_from_slice(&target.port().to_be_bytes());
     stream
         .write_all(&req)
         .map_err(|e| EcError::Runtime(format!("proxy connect request write failed: {e}")))
@@ -332,18 +321,20 @@ fn socks5_reply_name(code: u8) -> &'static str {
     }
 }
 
-fn append_socks5_addr(buf: &mut Vec<u8>, host: &str) -> EcResult<()> {
-    let host = host.trim();
-    if let Ok(ipv4) = host.parse::<Ipv4Addr>() {
-        buf.push(SOCKS_ATYP_IPV4);
-        buf.extend_from_slice(&ipv4.octets());
-        return Ok(());
-    }
-    if let Ok(ipv6) = host.parse::<Ipv6Addr>() {
-        buf.push(SOCKS_ATYP_IPV6);
-        buf.extend_from_slice(&ipv6.octets());
-        return Ok(());
-    }
+fn append_socks5_addr(buf: &mut Vec<u8>, host: &TargetHost) -> EcResult<()> {
+    let host = match host {
+        TargetHost::Ip(IpAddr::V4(ip)) => {
+            buf.push(SOCKS_ATYP_IPV4);
+            buf.extend_from_slice(&ip.octets());
+            return Ok(());
+        }
+        TargetHost::Ip(IpAddr::V6(ip)) => {
+            buf.push(SOCKS_ATYP_IPV6);
+            buf.extend_from_slice(&ip.octets());
+            return Ok(());
+        }
+        TargetHost::Domain(host) => host.trim(),
+    };
     if host.is_empty() || host.len() > 255 {
         return Err(EcError::Runtime(
             "fallback proxy target domain is empty or too long".to_string(),
@@ -394,6 +385,7 @@ mod tests {
         connect_via_http_connect_proxy_with_timeout, connect_via_socks5_proxy_with_timeout,
         ensure_http_connect_success, parse_fallback_proxy, read_http_proxy_head,
     };
+    use crate::endpoint::{ConnectTarget, TargetHost};
     use std::io::{Read, Write};
     use std::net::{Ipv6Addr, TcpListener, TcpStream};
     use std::sync::mpsc;
@@ -612,7 +604,7 @@ mod tests {
         let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let mut encoded = Vec::new();
 
-        append_socks5_addr(&mut encoded, &ip.to_string()).unwrap();
+        append_socks5_addr(&mut encoded, &TargetHost::Ip(ip.into())).unwrap();
 
         assert_eq!(encoded[0], SOCKS_ATYP_IPV6);
         assert_eq!(&encoded[1..], &ip.octets());
@@ -620,7 +612,7 @@ mod tests {
 
     #[test]
     fn http_connect_ipv6_target_uses_bracketed_authority() {
-        let request = build_http_connect_request("2001:db8::1", 443);
+        let request = build_http_connect_request(&ConnectTarget::new("2001:db8::1", 443));
 
         assert!(request.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"));
         assert!(request.contains("Host: [2001:db8::1]:443\r\n"));
@@ -639,8 +631,7 @@ mod tests {
             });
             let result = connect_via_socks5_proxy_with_timeout(
                 &addr,
-                TEST_TARGET_HOST,
-                TEST_TARGET_PORT,
+                &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
                 Duration::from_secs(2),
             );
             proxy.join().unwrap();
@@ -661,8 +652,7 @@ mod tests {
             });
             let result = connect_via_http_connect_proxy_with_timeout(
                 &addr,
-                TEST_TARGET_HOST,
-                TEST_TARGET_PORT,
+                &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
                 Duration::from_secs(2),
             );
             proxy.join().unwrap();
@@ -753,8 +743,7 @@ mod tests {
 
         let err = connect_via_socks5_proxy_with_timeout(
             &addr,
-            TEST_TARGET_HOST,
-            TEST_TARGET_PORT,
+            &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
             TEST_PROXY_TIMEOUT,
         )
         .unwrap_err();
@@ -775,8 +764,7 @@ mod tests {
 
         let err = connect_via_socks5_proxy_with_timeout(
             &addr,
-            TEST_TARGET_HOST,
-            TEST_TARGET_PORT,
+            &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
             TEST_PROXY_TIMEOUT,
         )
         .unwrap_err();
@@ -796,8 +784,7 @@ mod tests {
 
         let err = connect_via_http_connect_proxy_with_timeout(
             &addr,
-            TEST_TARGET_HOST,
-            TEST_TARGET_PORT,
+            &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
             TEST_PROXY_TIMEOUT,
         )
         .unwrap_err();
@@ -820,8 +807,7 @@ mod tests {
         });
         let socks_stream = connect_via_socks5_proxy_with_timeout(
             &socks_addr,
-            TEST_TARGET_HOST,
-            TEST_TARGET_PORT,
+            &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
             TEST_PROXY_TIMEOUT,
         )
         .unwrap();
@@ -838,8 +824,7 @@ mod tests {
         });
         let http_stream = connect_via_http_connect_proxy_with_timeout(
             &http_addr,
-            TEST_TARGET_HOST,
-            TEST_TARGET_PORT,
+            &ConnectTarget::new(TEST_TARGET_HOST, TEST_TARGET_PORT),
             TEST_PROXY_TIMEOUT,
         )
         .unwrap();
