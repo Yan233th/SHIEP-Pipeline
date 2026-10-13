@@ -3,6 +3,7 @@ use crate::{CipherSuite, Error, Version};
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
 use std::io::{Read, Write};
+use std::ops::Range;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -87,14 +88,14 @@ impl Keys {
         Ok(result)
     }
 
-    pub(crate) fn open(
+    pub(crate) fn open_in_place(
         &mut self,
         kind: u8,
         version: Version,
-        wire: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        wire: &mut Zeroizing<Vec<u8>>,
+    ) -> Result<Range<usize>, Error> {
         let seq = self.next_sequence()?;
-        let encrypted = if self.etm {
+        let encrypted_len = if self.etm {
             if wire.len() < 52 {
                 return Err(Error::BadRecordMac);
             }
@@ -103,15 +104,15 @@ impl Keys {
             if !bool::from(expected.ct_eq(mac)) {
                 return Err(Error::BadRecordMac);
             }
-            body
+            body.len()
         } else {
-            wire
+            wire.len()
         };
-        if encrypted.len() < 32 || encrypted.len() % 16 != 0 {
+        if encrypted_len < 32 || encrypted_len % 16 != 0 {
             return Err(Error::BadRecordMac);
         }
-        let mut iv: [u8; 16] = encrypted[..16].try_into().expect("IV length");
-        let mut body = Zeroizing::new(encrypted[16..].to_vec());
+        let mut iv: [u8; 16] = wire[..16].try_into().expect("IV length");
+        let body = &mut wire[16..encrypted_len];
         for chunk in body.chunks_exact_mut(16) {
             let next: [u8; 16] = chunk.try_into().expect("CBC block length");
             let block = aes::cipher::Block::<Aes128>::from_mut_slice(chunk);
@@ -125,19 +126,19 @@ impl Keys {
             iv = next;
         }
         let content_len = if self.etm {
-            let (count, valid) = check_padding(&body);
+            let (count, valid) = check_padding(body);
             if !bool::from(valid) {
                 return Err(Error::BadRecordMac);
             }
             body.len() - count
         } else {
-            verify_cbc_mac(&self.mac, seq, kind, version, &body)?
+            verify_cbc_mac(&self.mac, seq, kind, version, body)?
         };
         if content_len > MAX_PLAINTEXT {
             return Err(Error::Protocol("TLS plaintext too large"));
         }
-        body.truncate(content_len);
-        Ok(body)
+        // Expose the authenticated range without moving plaintext over the IV.
+        Ok(16..16 + content_len)
     }
 }
 

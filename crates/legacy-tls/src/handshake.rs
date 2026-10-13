@@ -351,20 +351,22 @@ impl Messages {
             if version.is_some_and(|version| version as u16 != wire_version) {
                 return Err(Error::Protocol("TLS record version changed"));
             }
+            let mut body = Zeroizing::new(body);
             let plain = if let Some(keys) = keys.as_mut() {
-                keys.open(
+                let content = keys.open_in_place(
                     kind,
                     version.expect("encrypted record has a negotiated version"),
-                    &body,
-                )?
+                    &mut body,
+                )?;
+                &body[content]
             } else {
                 if body.len() > record::MAX_PLAINTEXT {
                     return Err(Error::Protocol("TLS plaintext too large"));
                 }
-                Zeroizing::new(body)
+                body.as_slice()
             };
             if kind == 21 {
-                return Err(alert(&plain));
+                return Err(alert(plain));
             }
             if kind != 22 {
                 return Err(Error::Protocol("unexpected TLS handshake record"));
@@ -376,7 +378,7 @@ impl Messages {
             if self.total > 4 * MAX_HANDSHAKE {
                 return Err(Error::Protocol("TLS handshake too large"));
             }
-            self.pending.extend_from_slice(&plain);
+            self.pending.extend_from_slice(plain);
         }
     }
 }

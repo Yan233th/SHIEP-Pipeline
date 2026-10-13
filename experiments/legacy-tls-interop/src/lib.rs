@@ -85,7 +85,8 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
         (SslVersion::TLS1_2, Version::Tls12),
     ] {
         for cipher in ["AES128-SHA", "AES256-SHA"] {
-            for marker in [false, true] {
+            for (marker, offer_etm) in [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let context = context(wire, cipher);
                 let (client, server) = sockets();
                 let content: Vec<u8> = (0..65_573).map(|i| i as u8).collect();
@@ -108,6 +109,7 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
                 let mut config = ClientConfig::new(Arc::new(NoCertificateVerification));
                 config.min_version = version;
                 config.max_version = version;
+                config.encrypt_then_mac = offer_etm;
                 config.server_name = Some("legacy.example.test".into());
                 if marker {
                     config.session_id = [b"L3IP".as_slice(), &[0; 28]].concat();
@@ -116,7 +118,10 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
                 assert_eq!(stream.version(), version);
                 assert_eq!(stream.cipher_suite().name(), cipher);
                 assert!(stream.extended_master_secret());
-                assert_eq!(stream.encrypt_then_mac(), !cfg!(feature = "aws-lc"));
+                assert_eq!(
+                    stream.encrypt_then_mac(),
+                    offer_etm && !cfg!(feature = "aws-lc")
+                );
                 assert!(!stream.session_id().is_empty());
                 assert!(!stream.session_id().starts_with(b"L3IP"));
                 stream.write_all(&content).unwrap();

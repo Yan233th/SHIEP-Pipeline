@@ -189,12 +189,11 @@ fn peer_close_gets_one_authenticated_reply_and_discards_later_data() {
     let (kind, version, ciphertext) = record::Reader::default().read(&mut cursor).unwrap();
     assert_eq!((kind, version), (21, 0x0302));
     let mut keys = record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
-    assert_eq!(
-        keys.open(kind, Version::Tls11, &ciphertext)
-            .unwrap()
-            .as_slice(),
-        &[1, 0]
-    );
+    let mut ciphertext = Zeroizing::new(ciphertext);
+    let content = keys
+        .open_in_place(kind, Version::Tls11, &mut ciphertext)
+        .unwrap();
+    assert_eq!(&ciphertext[content], &[1, 0]);
     assert!(cursor.is_empty());
     stream.close().unwrap();
     assert_eq!(stream.read(&mut byte).unwrap(), 0);
@@ -255,10 +254,9 @@ fn fragmented_close_and_fragmented_or_coalesced_hello_requests_are_processed() {
         for expected in [&[1, 100][..], &[1, 100], &[1, 100], &[1, 0]] {
             let (kind, _, body) = reader.read(&mut wire).unwrap();
             assert_eq!(kind, 21);
-            assert_eq!(
-                keys.open(kind, Version::Tls11, &body).unwrap().as_slice(),
-                expected
-            );
+            let mut body = Zeroizing::new(body);
+            let content = keys.open_in_place(kind, Version::Tls11, &mut body).unwrap();
+            assert_eq!(&body[content], expected);
         }
         assert!(wire.is_empty());
     }

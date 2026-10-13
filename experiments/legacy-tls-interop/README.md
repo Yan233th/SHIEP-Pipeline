@@ -8,7 +8,8 @@ cargo test --manifest-path experiments/legacy-tls-interop/Cargo.toml --locked
 cargo test --manifest-path experiments/legacy-tls-interop/Cargo.toml --locked --features aws-lc
 ```
 
-The first command uses the installed OpenSSL, including encrypt-then-MAC. The
+The first command uses the installed OpenSSL with both encrypt-then-MAC and
+traditional MAC-then-encrypt. The
 second builds AWS-LC, exercising traditional MAC-then-encrypt. Both check TLS
 1.1/1.2, AES128/256, SNI, L3IP identifiers without session resumption, fragmented
 I/O, multi-record bidirectional traffic, certificate rejection, tampered server

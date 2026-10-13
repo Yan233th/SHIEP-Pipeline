@@ -135,8 +135,7 @@ impl<S: Read + Write> TlsStream<S> {
                 out[..n].copy_from_slice(&self.plain[self.offset..self.offset + n]);
                 self.offset += n;
                 if self.offset == self.plain.len() {
-                    self.plain.fill(0);
-                    self.plain.clear();
+                    self.plain = Zeroizing::new(Vec::new());
                     self.offset = 0;
                 }
                 return Ok(n);
@@ -148,7 +147,11 @@ impl<S: Read + Write> TlsStream<S> {
             if version != self.version as u16 {
                 return Err(Error::Protocol("TLS record version changed"));
             }
-            let plain = self.read_keys.open(kind, self.version, &body)?;
+            let mut body = Zeroizing::new(body);
+            let content = self
+                .read_keys
+                .open_in_place(kind, self.version, &mut body)?;
+            let plain = &body[content.clone()];
             match kind {
                 23 if self.control.filled != 0 => {
                     return Err(Error::Protocol(
@@ -156,12 +159,14 @@ impl<S: Read + Write> TlsStream<S> {
                     ));
                 }
                 23 if !plain.is_empty() => {
-                    self.plain = plain;
+                    body.truncate(content.end);
+                    self.plain = body;
+                    self.offset = content.start;
                     continue;
                 }
                 23 => {}
                 21 | 22 if !plain.is_empty() => {
-                    let mut input = plain.as_slice();
+                    let mut input = plain;
                     while !input.is_empty() {
                         if let Some(message) = self.control.consume(kind, &mut input)? {
                             match (kind, message) {

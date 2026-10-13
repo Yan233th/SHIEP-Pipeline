@@ -11,23 +11,34 @@ fn both_ciphers_and_mac_modes_reject_tampering_replay_and_wrong_type() {
                 let plain = vec![0xac; size];
                 let encrypted = fresh().seal(23, Version::Tls11, &plain).unwrap();
                 let mut receiver = fresh();
-                assert_eq!(
-                    *receiver.open(23, Version::Tls11, &encrypted).unwrap(),
-                    plain
-                );
+                let mut buffer = Zeroizing::new(encrypted.clone());
+                let allocation = buffer.as_ptr();
+                let content = receiver
+                    .open_in_place(23, Version::Tls11, &mut buffer)
+                    .unwrap();
+                assert_eq!(buffer.as_ptr(), allocation);
+                assert_eq!(buffer[content], plain);
                 assert!(matches!(
-                    receiver.open(23, Version::Tls11, &encrypted),
+                    receiver.open_in_place(
+                        23,
+                        Version::Tls11,
+                        &mut Zeroizing::new(encrypted.clone())
+                    ),
                     Err(Error::BadRecordMac)
                 ));
                 assert!(matches!(
-                    fresh().open(22, Version::Tls11, &encrypted),
+                    fresh().open_in_place(
+                        22,
+                        Version::Tls11,
+                        &mut Zeroizing::new(encrypted.clone())
+                    ),
                     Err(Error::BadRecordMac)
                 ));
                 for index in [0, 15, 16, encrypted.len() - 1] {
-                    let mut broken = encrypted.clone();
+                    let mut broken = Zeroizing::new(encrypted.clone());
                     broken[index] ^= 1;
                     assert!(matches!(
-                        fresh().open(23, Version::Tls11, &broken),
+                        fresh().open_in_place(23, Version::Tls11, &mut broken),
                         Err(Error::BadRecordMac)
                     ));
                 }
