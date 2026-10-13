@@ -25,13 +25,11 @@ fn stream<S>(io: S) -> TlsStream<S> {
 #[test]
 fn a_corrupt_record_never_releases_plaintext_and_terminates_the_stream() {
     let mut keys = record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
-    let mut encrypted = keys
-        .seal(23, Version::Tls11, b"authenticated message")
+    let mut wire = keys
+        .seal_record(23, Version::Tls11, b"authenticated message")
         .unwrap();
-    encrypted[0] ^= 1;
-    let mut wire = Vec::new();
-    record::write(&mut wire, 23, Version::Tls11, &encrypted).unwrap();
-    let mut stream = stream(Cursor::new(wire));
+    wire[5] ^= 1;
+    let mut stream = stream(Cursor::new(wire.to_vec()));
     let mut out = [0x44; 128];
     assert_eq!(
         stream.read(&mut out).unwrap_err().kind(),
@@ -51,8 +49,7 @@ fn short_application_reads_preserve_data_and_close_notify_is_idempotent() {
     let mut keys = record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
     let mut wire = Vec::new();
     for (kind, plain) in [(23, b"hello".as_slice()), (21, &[1, 0])] {
-        let body = keys.seal(kind, Version::Tls11, plain).unwrap();
-        record::write(&mut wire, kind, Version::Tls11, &body).unwrap();
+        wire.extend_from_slice(&keys.seal_record(kind, Version::Tls11, plain).unwrap());
     }
     let mut stream = stream(Cursor::new(wire));
     let mut byte = [0];
@@ -171,8 +168,9 @@ fn incoming(records: &[(u8, &[u8])]) -> Duplex {
     let mut io = Duplex::default();
     let mut keys = record::Keys::new(CipherSuite::Aes128Sha, &[7; 16], &[9; 20], false);
     for (kind, bytes) in records {
-        let sealed = keys.seal(*kind, Version::Tls11, bytes).unwrap();
-        record::write(io.input.get_mut(), *kind, Version::Tls11, &sealed).unwrap();
+        io.input
+            .get_mut()
+            .extend_from_slice(&keys.seal_record(*kind, Version::Tls11, bytes).unwrap());
     }
     io
 }

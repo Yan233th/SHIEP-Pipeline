@@ -48,28 +48,32 @@ impl Keys {
         Ok(current)
     }
 
-    pub(crate) fn seal(
+    pub(crate) fn seal_record(
         &mut self,
         kind: u8,
         version: Version,
         plain: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
         if plain.len() > MAX_PLAINTEXT {
             return Err(Error::Protocol("TLS plaintext too large"));
         }
         let seq = self.next_sequence()?;
-        let mut body = Zeroizing::new(plain.to_vec());
-        if !self.etm {
-            body.extend_from_slice(&record_mac(self.mac.as_ref(), seq, kind, version, plain));
-        }
-        let padding = 15 - body.len() % 16;
-        let padded_len = body.len() + padding + 1;
-        body.resize(padded_len, padding as u8);
+        let content_len = plain.len() + if self.etm { 0 } else { 20 };
+        let padding = 15 - content_len % 16;
+        let encrypted_len = 16 + content_len + padding + 1;
+        let body_len = encrypted_len + if self.etm { 20 } else { 0 };
         let mut iv = [0; 16];
         random(&mut iv)?;
-        let mut result = Vec::with_capacity(16 + body.len() + 20);
-        result.extend_from_slice(&iv);
-        for chunk in body.chunks_exact_mut(16) {
+        let mut wire = Zeroizing::new(Vec::with_capacity(5 + body_len));
+        wire.extend_from_slice(&header(kind, version, body_len)?);
+        wire.extend_from_slice(&iv);
+        wire.extend_from_slice(plain);
+        if !self.etm {
+            wire.extend_from_slice(&record_mac(self.mac.as_ref(), seq, kind, version, plain));
+        }
+        wire.resize(5 + encrypted_len, padding as u8);
+        // Encrypt in the final record allocation, after its header and explicit IV.
+        for chunk in wire[5 + 16..].chunks_exact_mut(16) {
             for (byte, previous) in chunk.iter_mut().zip(iv) {
                 *byte ^= previous;
             }
@@ -79,13 +83,12 @@ impl Keys {
                 Cipher::Aes256(cipher) => cipher.encrypt_block(block),
             }
             iv.copy_from_slice(chunk);
-            result.extend_from_slice(chunk);
         }
         if self.etm {
-            let mac = record_mac(self.mac.as_ref(), seq, kind, version, &result);
-            result.extend_from_slice(&mac);
+            let mac = record_mac(self.mac.as_ref(), seq, kind, version, &wire[5..]);
+            wire.extend_from_slice(&mac);
         }
-        Ok(result)
+        Ok(wire)
     }
 
     pub(crate) fn open_in_place(
@@ -196,14 +199,20 @@ pub(crate) fn write<S: Write>(
     version: Version,
     body: &[u8],
 ) -> Result<(), Error> {
-    let len = u16::try_from(body.len()).map_err(|_| Error::Protocol("TLS record too large"))?;
-    let version = (version as u16).to_be_bytes();
-    let len = len.to_be_bytes();
+    let header = header(kind, version, body.len())?;
     let mut wire = Vec::with_capacity(5 + body.len());
-    wire.extend_from_slice(&[kind, version[0], version[1], len[0], len[1]]);
+    wire.extend_from_slice(&header);
     wire.extend_from_slice(body);
     io.write_all(&wire)?;
     Ok(())
+}
+
+fn header(kind: u8, version: Version, len: usize) -> Result<[u8; 5], Error> {
+    let len = u16::try_from(len)
+        .map_err(|_| Error::Protocol("TLS record too large"))?
+        .to_be_bytes();
+    let version = (version as u16).to_be_bytes();
+    Ok([kind, version[0], version[1], len[0], len[1]])
 }
 
 #[cfg(test)]

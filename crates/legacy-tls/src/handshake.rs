@@ -120,8 +120,7 @@ pub(crate) fn connect<S: Read + Write>(
         verify.as_mut(),
     );
     let finished = message(20, verify.as_ref())?;
-    let encrypted = write_keys.seal(22, version, &finished)?;
-    record::write(&mut io, 22, version, &encrypted)?;
+    io.write_all(&write_keys.seal_record(22, version, &finished)?)?;
     transcript.update(&finished);
     io.flush()?;
 

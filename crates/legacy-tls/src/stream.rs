@@ -97,8 +97,8 @@ impl<S: Read + Write> TlsStream<S> {
         }
         let result = self
             .write_keys
-            .seal(kind, self.version, data)
-            .and_then(|body| record::write(&mut self.io, kind, self.version, &body));
+            .seal_record(kind, self.version, data)
+            .and_then(|wire| self.io.write_all(&wire).map_err(Error::from));
         if result.is_err() {
             self.failed = true;
         }
