@@ -42,7 +42,7 @@ use std::time::Duration;
 
 struct ApplicationVerifier;
 impl CertificateVerifier for ApplicationVerifier {
-    fn verify(&self, _chain: &[Vec<u8>], _server: Option<&str>) -> Result<(), Error> {
+    fn verify(&self, _chain: &[&[u8]], _server: Option<&str>) -> Result<(), Error> {
         // Apply the application's certificate trust and endpoint identity policy.
         Err(Error::Certificate)
     }

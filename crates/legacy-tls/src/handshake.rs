@@ -37,7 +37,7 @@ pub(crate) fn connect<S: Read + Write>(
         .verifier
         .verify(&certificates, config.server_name.as_deref())?;
     let certificate =
-        x509_cert::Certificate::from_der(&certificates[0]).map_err(|_| Error::Certificate)?;
+        x509_cert::Certificate::from_der(certificates[0]).map_err(|_| Error::Certificate)?;
     let spki = certificate
         .tbs_certificate
         .subject_public_key_info
@@ -300,7 +300,7 @@ fn server_hello(config: &ClientConfig, body: &[u8]) -> Result<Negotiated, Error>
     })
 }
 
-fn certificates(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+fn certificates(body: &[u8]) -> Result<Vec<&[u8]>, Error> {
     let mut outer = Cursor(body);
     let mut cursor = Cursor(outer.vector24()?);
     outer.end()?;
@@ -313,7 +313,7 @@ fn certificates(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
         if cert.is_empty() {
             return Err(Error::Certificate);
         }
-        chain.push(cert.to_vec());
+        chain.push(cert);
     }
     if chain.is_empty() {
         return Err(Error::Certificate);

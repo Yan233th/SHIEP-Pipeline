@@ -83,9 +83,10 @@ impl CipherSuite {
 ///
 /// Implementations must check their trust policy, certificate validity and the
 /// expected endpoint identity. The chain is leaf-first and nonempty.
+/// DER entries borrow the handshake message for the duration of verification.
 pub trait CertificateVerifier: Send + Sync {
     /// Reject a chain that does not authenticate the expected endpoint.
-    fn verify(&self, chain: &[Vec<u8>], server_name: Option<&str>) -> Result<(), Error>;
+    fn verify(&self, chain: &[&[u8]], server_name: Option<&str>) -> Result<(), Error>;
 }
 
 /// Explicit opt-out for deployments which already use unauthenticated TLS.
@@ -97,7 +98,7 @@ pub mod danger {
     pub struct NoCertificateVerification;
 
     impl CertificateVerifier for NoCertificateVerification {
-        fn verify(&self, _: &[Vec<u8>], _: Option<&str>) -> Result<(), Error> {
+        fn verify(&self, _: &[&[u8]], _: Option<&str>) -> Result<(), Error> {
             Ok(())
         }
     }

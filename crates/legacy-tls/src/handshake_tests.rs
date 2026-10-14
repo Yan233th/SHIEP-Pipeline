@@ -71,6 +71,39 @@ fn malformed_certificate_vectors_fail_without_panics() {
 }
 
 #[test]
+fn certificate_chain_borrows_ordered_entries_and_requires_complete_framing() {
+    let body = [0, 0, 11, 0, 0, 3, 0x30, 1, 2, 0, 0, 2, 0x30, 0];
+    let chain = certificates(&body).unwrap();
+    assert_eq!(chain, [&body[6..9], &body[12..14]]);
+    assert_eq!(chain[0].as_ptr(), body[6..].as_ptr());
+    assert_eq!(chain[1].as_ptr(), body[12..].as_ptr());
+    for end in 0..body.len() {
+        assert!(certificates(&body[..end]).is_err());
+    }
+    let mut trailing = body.to_vec();
+    trailing.push(0);
+    assert!(certificates(&trailing).is_err());
+}
+
+#[test]
+fn certificate_chain_length_is_bounded() {
+    for count in [16, 17] {
+        let mut body = vec![0, 0, count * 4];
+        for _ in 0..count {
+            body.extend_from_slice(&[0, 0, 1, 0x30]);
+        }
+        match certificates(&body) {
+            Ok(chain) => {
+                assert_eq!(count, 16);
+                assert_eq!(chain.len(), 16);
+            }
+            Err(Error::Protocol("TLS certificate chain too long")) => assert_eq!(count, 17),
+            Err(error) => panic!("unexpected certificate error: {error}"),
+        }
+    }
+}
+
+#[test]
 fn sni_rejects_ip_literals_controls_and_invalid_dns_labels() {
     for name in [
         "",

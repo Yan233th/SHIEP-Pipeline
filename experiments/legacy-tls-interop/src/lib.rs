@@ -136,7 +136,7 @@ fn reference_server_accepts_both_versions_ciphers_and_l3ip_full_handshakes() {
 
 struct Reject;
 impl CertificateVerifier for Reject {
-    fn verify(&self, _: &[Vec<u8>], _: Option<&str>) -> Result<(), Error> {
+    fn verify(&self, _: &[&[u8]], _: Option<&str>) -> Result<(), Error> {
         Err(Error::Certificate)
     }
 }
